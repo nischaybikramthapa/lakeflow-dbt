@@ -19,7 +19,7 @@ def test_compile_command(capsys):
                "--vars", '{"currency": "EUR"}'])
     assert rc == 0
     out = capsys.readouterr().out
-    assert "Compiled" in out
+    assert "compiled" in out
     target = EXAMPLE / "target"
     assert (target / "spark-pipeline.yml").exists()
     sql = (target / "definitions" / "customers.sql").read_text()

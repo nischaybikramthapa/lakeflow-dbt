@@ -95,10 +95,34 @@ class Graph:
                 seeds = [n for n, m in self.models.items() if m.resource_type == rt]
                 if not seeds:
                     raise GraphError(f"no nodes with resource_type {rt!r}")
+            elif core.startswith("source:"):
+                key = core[7:]
+                seeds = [n for n, m in self.models.items() if key in m.sources]
+                if not seeds:
+                    raise GraphError(f"no models read source {key!r}")
+            elif core.startswith("path:"):
+                pref = core[5:].strip("/")
+                seeds = [
+                    n for n, m in self.models.items()
+                    if m.fqn_dir == pref or m.fqn_dir.startswith(pref + "/")
+                    or str(m.rel_path).startswith(pref + "/")
+                    or f"/{pref}/" in str(m.rel_path)
+                ]
+                if not seeds:
+                    raise GraphError(f"no models under path {pref!r}")
             else:
-                if core not in self.models:
-                    raise GraphError(f"selector {core!r} matches no model")
-                seeds = [core]
+                if core in self.models:
+                    seeds = [core]
+                else:
+                    # bare directory name: dbt fqn semantics — `staging` selects
+                    # everything under models/staging/
+                    seeds = [
+                        n for n, m in self.models.items()
+                        if m.fqn_dir == core or m.fqn_dir.startswith(core + "/")
+                        or f"/{core}" in m.fqn_dir
+                    ]
+                    if not seeds:
+                        raise GraphError(f"selector {core!r} matches no model")
             for s in seeds:
                 chosen.add(s)
                 if parents:

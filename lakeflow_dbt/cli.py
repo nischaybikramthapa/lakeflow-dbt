@@ -115,21 +115,30 @@ def cmd_parse(args) -> int:
 
 def cmd_compile(args) -> int:
     project, parsed = _load(args)
-    result = Compiler(project, parsed).compile(select=args.select)
-    _print_warnings(result.warnings)
-    print(f"Compiled {len(result.files)} definition file(s) -> {result.target_dir}")
-    for f in result.files:
-        print(f"  {f.relative_to(result.target_dir)}")
-    print(f"  {result.spec_file.relative_to(result.target_dir)}")
+    results = Compiler(project, parsed).compile_pipelines(
+        select=args.select, pipeline=args.pipeline)
+    for pname, result in results.items():
+        _print_warnings(result.warnings)
+        print(f"pipeline {pname}: compiled {len(result.files)} "
+              f"definition file(s) -> {result.target_dir}")
+        for f in result.files:
+            print(f"  {f.relative_to(result.target_dir)}")
+        print(f"  {result.spec_file.relative_to(result.target_dir)}")
     return 0
 
 
 def cmd_ls(args) -> int:
     project, parsed = _load(args)
     compiler = Compiler(project, parsed)
+    assigned: dict = {}
+    if project.pipelines:
+        for pname, sel in compiler.pipeline_assignments().items():
+            for n in sel:
+                assigned[n] = pname
     for name in compiler.graph.select(args.select):
         m = parsed.models[name]
-        print(f"{name:30s} {m.materialization:18s} {m.rel_path}")
+        pipe = f" [{assigned.get(name, '-')}]" if project.pipelines else ""
+        print(f"{name:30s} {m.materialization:18s}{pipe} {m.rel_path}")
     return 0
 
 
@@ -148,19 +157,25 @@ def cmd_seed(args) -> int:
     return 0
 
 
-def _refresh_cmd(args, compiler: Compiler) -> list:
-    """Translate --refresh/--full-refresh selectors into spark-pipelines args."""
+def _refresh_cmd(args, compiler: Compiler, within=None) -> list:
+    """Translate --refresh/--full-refresh selectors into spark-pipelines args.
+
+    ``within`` limits resolution to one pipeline's emitted datasets; a
+    pipeline with no matching datasets gets no flags (nothing to refresh).
+    """
     if args.full_refresh_all and (args.refresh or args.full_refresh):
         raise LakeflowDbtError(
             "--full-refresh-all can't be combined with --refresh/--full-refresh"
         )
     out: list = []
     if args.refresh:
-        ds = compiler.resolve_datasets(args.refresh)
-        out += ["--refresh", ",".join(ds)]
+        ds = compiler.resolve_datasets(args.refresh, within=within)
+        if ds:
+            out += ["--refresh", ",".join(ds)]
     if args.full_refresh:
-        ds = compiler.resolve_datasets(args.full_refresh)
-        out += ["--full-refresh", ",".join(ds)]
+        ds = compiler.resolve_datasets(args.full_refresh, within=within)
+        if ds:
+            out += ["--full-refresh", ",".join(ds)]
     if args.full_refresh_all:
         out += ["--full-refresh-all"]
     return out
@@ -176,22 +191,28 @@ def cmd_run(args) -> int:
     # compile the whole project, not a --select-trimmed subset
     has_refresh = args.refresh or args.full_refresh or args.full_refresh_all
     select = None if has_refresh else args.select
-    result = compiler.compile(select=select)
-    _print_warnings(result.warnings)
+    results = compiler.compile_pipelines(select=select, pipeline=args.pipeline)
+    for r in results.values():
+        _print_warnings(r.warnings)
 
     tool = "dry-run" if args.dry_run else "run"
-    cmd = ["spark-pipelines", tool, "--spec", str(result.spec_file)]
-    cmd += _refresh_cmd(args, compiler)
-    cmd += args.spark_args or []
-
-    if shutil.which("spark-pipelines") is None:
+    missing_cli = shutil.which("spark-pipelines") is None
+    if missing_cli:
         print("`spark-pipelines` CLI not found on PATH.")
         print("Install it with `pip install 'pyspark[pipelines]'`, or on Databricks")
         print("deploy target/ via a bundle pointing at the generated spec, then run:")
-        print("  " + " ".join(cmd))
-        return 2
-    print("+ " + " ".join(cmd))
-    return subprocess.call(cmd, cwd=result.target_dir)
+    rc = 2 if missing_cli else 0
+    for pname, result in results.items():
+        emitted = compiler.pipeline_assignments().get(pname) if project.pipelines else None
+        cmd = ["spark-pipelines", tool, "--spec", str(result.spec_file)]
+        cmd += _refresh_cmd(args, compiler, within=emitted)
+        cmd += args.spark_args or []
+        if missing_cli:
+            print("  " + " ".join(cmd))
+            continue
+        print(f"+ [{pname}] " + " ".join(cmd))
+        rc = subprocess.call(cmd, cwd=result.target_dir) or rc
+    return rc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -217,7 +238,9 @@ def build_parser() -> argparse.ArgumentParser:
         ("ls", "list models"),
     ):
         s = sub.add_parser(name, help=help_)
-        s.add_argument("--select", help="dbt-style selection: `+a b+ tag:x`")
+        s.add_argument("--select", help="dbt-style selection: `+a b+ tag:x path:dir source:s`")
+        s.add_argument("--pipeline", action="append",
+                       help="only this `pipelines:` entry (repeatable)")
         s.add_argument("--vars", help="inline JSON/YAML map of vars for {{ var() }}")
         s.set_defaults(fn={"compile": cmd_compile, "run": cmd_run,
                            "refresh": cmd_run, "ls": cmd_ls}[name])

@@ -8,27 +8,41 @@ from typing import Any, Dict, List, Optional
 
 NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-#: dbt materialization -> the declarative dataset/flow it compiles to.
+#: dbt materialization -> the declarative dataset it compiles to.
+# A materialization is only ever a view, a temp view, a materialized view,
+# or a streaming table — AUTO CDC is a *flow* on a streaming table, not a
+# materialization (see ModelConfig.flow).
 MATERIALIZATIONS = {
     "view": "view",
     "temp_view": "temporary_view",
     "temporary_view": "temporary_view",
     "table": "materialized_view",
     "incremental": "streaming_table",
-    "auto_cdc": "auto_cdc",
-    "snapshot": "auto_cdc_snapshot",
     "ephemeral": "cte",
 }
-# Aliases accepted in {{ config(materialized=...) }}
+# Aliases accepted in {{ config(materialized=...) }} -> canonical materialized
 MATERIALIZATION_ALIASES = {
     "materialized_view": "table",
     "mv": "table",
     "streaming_table": "incremental",
     "stream": "incremental",
-    "apply_changes": "auto_cdc",
-    "scd2": "snapshot",
-    "scd_type_2": "snapshot",
+    # legacy materializations -> incremental + a flow config (see below)
+    "auto_cdc": "incremental",
+    "apply_changes": "incremental",
+    "snapshot": "incremental",
+    "scd2": "incremental",
+    "scd_type_2": "incremental",
 }
+# materialized values that imply a non-default flow config
+MATERIALIZATION_FLOW_OVERRIDES = {
+    "auto_cdc": {"flow": "auto_cdc"},
+    "apply_changes": {"flow": "auto_cdc"},
+    "snapshot": {"flow": "auto_cdc", "snapshot": True},
+    "scd2": {"flow": "auto_cdc", "snapshot": True},
+    "scd_type_2": {"flow": "auto_cdc", "snapshot": True},
+}
+
+VALID_FLOWS = {"append", "auto_cdc"}
 
 #: stored_as value -> SQL
 STORED_AS = {
@@ -57,6 +71,10 @@ class ModelConfig:
     # default ON VIOLATION action for this model's tests: warn|drop|fail
     on_violation: str = "warn"
     private: bool = False
+    # flow kind on a streaming table: 'append' (INSERT INTO ... BY NAME) or
+    # 'auto_cdc' (AUTO CDC INTO / FROM SNAPSHOT). Not a materialization.
+    flow: str = "append"
+    snapshot: bool = False              # auto_cdc reads FROM SNAPSHOT (query)
     # AUTO CDC / snapshot flow options
     keys: List[str] = field(default_factory=list)
     sequence_by: Any = None            # str column or list -> STRUCT(...)
@@ -79,6 +97,9 @@ class ModelConfig:
         for k, v in (other or {}).items():
             k = k.lstrip("+")
             if k == "materialized":
+                overrides = MATERIALIZATION_FLOW_OVERRIDES.get(v, {})
+                for ok, ov in overrides.items():
+                    setattr(cfg, ok, ov)
                 v = MATERIALIZATION_ALIASES.get(v, v)
                 if v not in MATERIALIZATIONS:
                     unknown.append(f"materialized={v!r}")
@@ -92,6 +113,17 @@ class ModelConfig:
         if cfg.on_violation not in VALID_VIOLATIONS:
             raise ValueError(
                 f"on_violation must be one of {sorted(VALID_VIOLATIONS)}, got {cfg.on_violation!r}"
+            )
+        if cfg.flow not in VALID_FLOWS:
+            raise ValueError(
+                f"flow must be one of {sorted(VALID_FLOWS)}, got {cfg.flow!r}"
+            )
+        if cfg.flow != "append" and cfg.materialized not in (
+            "incremental",
+        ):
+            raise ValueError(
+                f"flow={cfg.flow!r} requires materialized='incremental' "
+                f"(a streaming table), got {cfg.materialized!r}"
             )
         return cfg
 
@@ -183,6 +215,10 @@ class Project:
     seed_paths: List[str] = field(default_factory=list)
     # raw `seeds:` tree for +config resolution
     seed_tree: Dict[str, Any] = field(default_factory=dict)
+    # `pipelines:` map — pipeline name -> model selector. Empty = one pipeline
+    # containing the whole project (each entry compiles to its own spec +
+    # deploys as a separate pipeline in the Lakeflow UI)
+    pipelines: Dict[str, str] = field(default_factory=dict)
 
     def base_config(self) -> ModelConfig:
         return ModelConfig()

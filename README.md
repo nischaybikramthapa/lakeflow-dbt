@@ -64,8 +64,8 @@ models:
 | `materialized='incremental'`   | `CREATE OR REFRESH STREAMING TABLE` + `CREATE FLOW ... INSERT INTO ... BY NAME` |
 | `materialized='ephemeral'`     | inlined as a `WITH` CTE into each dependent                   |
 | `materialized='temp_view'`     | `CREATE TEMPORARY VIEW`                                       |
-| `materialized='auto_cdc'`      | `TEMPORARY VIEW` staging + `STREAMING TABLE` + `CREATE FLOW ... AUTO CDC INTO ... FROM STREAM` |
-| `materialized='snapshot'`      | `STREAMING TABLE` + `CREATE FLOW ... AUTO CDC ... FROM SNAPSHOT (query) WITH VERSION (expr)` |
+| `flow='auto_cdc'` (on `incremental`) | `TEMPORARY VIEW` staging + `CREATE FLOW ... AUTO CDC INTO ... FROM STREAM` |
+| `flow='auto_cdc', snapshot=true` | `CREATE FLOW ... AUTO CDC ... FROM SNAPSHOT (query) WITH VERSION (expr)` |
 | seed CSVs under `seed-paths`   | `CREATE OR REFRESH MATERIALIZED VIEW` over a `VALUES` literal (types inferred) |
 | `{{ ref('m') }}`               | dataset name; `STREAM(name)` inside flows when upstream is streaming |
 | `{{ source('s','t') }}`        | `catalog.schema.table` from `sources:`; `STREAM(...)` when flagged `streaming: true` and read inside a flow |
@@ -76,8 +76,7 @@ models:
 | `description`                  | `COMMENT '...'`                                               |
 | `cluster_by`, `partition_cols`, `tblproperties` | `CLUSTER BY` / `PARTITIONED BY` / `TBLPROPERTIES` clauses |
 | `on_violation: warn/drop/fail` | plain `EXPECT` / `ON VIOLATION DROP ROW` / `FAIL UPDATE`      |
-| `keys`, `sequence_by`, `stored_as`, `track_history`, `apply_as_deletes/truncates`, `ignore_null_updates`, `columns`, `once` | `AUTO CDC INTO` clauses on the flow |
-| `version` (snapshot)           | `WITH VERSION (expr)` for ordering snapshots                   |
+| `flow`, `keys`, `sequence_by`, `stored_as`, `track_history`, `apply_as_deletes/truncates`, `ignore_null_updates`, `columns`, `once`, `snapshot`, `version` | `AUTO CDC INTO` / `FROM SNAPSHOT` flow clauses on the streaming table |
 | `into: other_model`            | flow-only model: no dataset DDL, just an extra `FLOW ... INTO` another model's streaming table (multi-append) |
 | `--select m / +m / m+ / tag:t / resource_type:seed` | dbt-style selection; `compile` also pulls in ancestors so the emitted pipeline is self-contained |
 | `{{ var('x') }}` / `--vars`    | project `vars:` + CLI overrides                                |
@@ -102,22 +101,47 @@ models:
     marts:   {+materialized: table, +on_violation: drop}
 seeds:                   # optional +config tree, same shape as models:
   jaffle_lake: {+materialized: table}
+
+# One project -> several pipelines. Each key emits its own
+# target/pipelines/<name>/spark-pipeline.yml and deploys as a separate
+# pipeline in the Lakeflow UI. Values are selectors.
+pipelines:
+  bronze: "ingestion resource_type:seed"   # source-system ingestion layer
+  gold: marts                              # a data product's models
 ```
 
-## AUTO CDC / snapshots (dbt `snapshot`, done declaratively)
+See `examples/layered_shop/` for a working multi-pipeline project. A `ref()`
+across pipeline boundaries resolves to a plain table read — `STREAM()` is
+emitted only within a pipeline. A dataset selected by two pipelines is a
+compile error; a model upstream of a pipeline but in none is flagged as an
+external read. Compile or run a subset with `--pipeline gold`.
+
+## Flows: append vs AUTO CDC
+
+`materialized` is only a dataset kind — `view`/`temp_view`/`table`
+(MV)/`incremental` (ST). How rows land in a streaming table is the *flow*:
 
 ```sql
-{{ config(materialized='auto_cdc', keys=['customer_id'],
-          sequence_by='updated_at', stored_as='scd_type_2',
-          track_history={'except': ['updated_at']},
+{{ config(materialized='incremental') }}
+-- ^ append flow: CREATE FLOW ... INSERT INTO ... BY NAME
+
+{{ config(materialized='incremental', flow='auto_cdc',
+          keys=['customer_id'], sequence_by='updated_at',
+          stored_as='scd_type_2', track_history={'except': ['updated_at']},
           apply_as_deletes="op = 'DELETE'") }}
-select * from {{ source('raw', 'customers_feed') }}
+-- ^ AUTO CDC INTO ... FROM STREAM(<staging temp view>)
+
+{{ config(materialized='incremental', flow='auto_cdc', snapshot=true,
+          keys=['sku'], version='snapshot_ts') }}
+-- ^ AUTO CDC ... FROM SNAPSHOT (query) WITH VERSION (expr)
 ```
 
-`auto_cdc` expects a change feed (`op`/`updated_at` style rows) and emits
-`AUTO CDC INTO ... FROM STREAM(<staging temp view>)`. `snapshot` expects
-periodic full snapshots and emits `AUTO CDC ... FROM SNAPSHOT (query)`
-(`version` orders the snapshots; `sequence_by` is rejected).
+`flow='auto_cdc'` expects a change feed (`op`/`updated_at` style rows) and emits
+`AUTO CDC INTO ... FROM STREAM(<staging temp view>)`. `snapshot=true`
+switches the source to `FROM SNAPSHOT (query)` — `version` orders the
+snapshots and `sequence_by` is rejected. The legacy spellings
+`materialized='auto_cdc'`/`'snapshot'`/`'apply_changes'` still work as
+aliases for these configs.
 
 ### Multiple flows into one table
 

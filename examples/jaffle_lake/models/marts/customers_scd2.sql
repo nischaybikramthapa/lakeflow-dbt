@@ -1,5 +1,6 @@
 {{ config(
-    materialized='auto_cdc',
+    materialized='incremental',
+    flow='auto_cdc',
     keys=['customer_id'],
     sequence_by='updated_at',
     stored_as='scd_type_2',

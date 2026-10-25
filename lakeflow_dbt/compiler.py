@@ -88,6 +88,10 @@ class Compiler:
         # view-type models upstream of a streaming table: published views can't
         # be streaming sources, so they compile to TEMPORARY VIEW + STREAM() reads
         self._stream_views: Set[str] = set()
+        # models emitted into the pipeline currently being compiled — a ref to
+        # a model outside this set is a cross-pipeline read (plain table name,
+        # never STREAM())
+        self._emitted: Set[str] = set()
 
     # -- marker resolution -------------------------------------------------
 
@@ -103,10 +107,17 @@ class Compiler:
                 ctes.add(name)
                 return model.dataset_name
             out = self._dataset_ref(model)
-            if streaming and (
+            if streaming and name in self._emitted and (
                 model.materialization == "streaming_table" or name in self._stream_views
             ):
                 return f"STREAM({out})"
+            if streaming and name not in self._emitted and (
+                model.materialization == "streaming_table"
+            ):
+                self.warnings.append(
+                    f"{model.name!r} is a streaming table in another pipeline; "
+                    f"read inside a flow resolves to a batch read of {out}"
+                )
             return out
 
         def src_sub(m: re.Match) -> str:
@@ -202,18 +213,16 @@ class Compiler:
 
     def _emit(self, model: Model) -> str:
         mat = model.materialization
-        if model.config.into and mat not in (
-            "streaming_table", "auto_cdc", "auto_cdc_snapshot"
-        ):
+        if model.config.into and mat != "streaming_table":
             raise CompilationError(
-                f"{model.name}: `into` requires a flow materialization "
-                f"('incremental', 'auto_cdc', or 'snapshot'), got "
+                f"{model.name}: `into` requires a streaming table "
+                f"(materialized='incremental'), got "
                 f"materialized={model.config.materialized!r}"
             )
         qname = model.qualified_name
         priv = "PRIVATE " if model.config.private else ""
         spec = ""
-        if mat in ("materialized_view", "streaming_table", "auto_cdc", "auto_cdc_snapshot"):
+        if mat in ("materialized_view", "streaming_table"):
             constraints = self._constraints(model)
             if constraints:
                 spec = " (\n  " + ",\n  ".join(constraints) + "\n)"
@@ -253,6 +262,10 @@ class Compiler:
                 f"AS\n{body};\n"
             )
         if mat == "streaming_table":
+            if model.config.flow == "auto_cdc":
+                return self._emit_auto_cdc(model, snapshot=model.config.snapshot,
+                                           header=header, spec=spec,
+                                           clauses=clauses)
             body = self._body(model, streaming=True)
             flow = f"CREATE FLOW {model.dataset_name}_flow AS INSERT INTO {qname} BY NAME\n{body};"
             if model.config.into:
@@ -266,9 +279,6 @@ class Compiler:
                 f"CREATE OR REFRESH {priv}STREAMING TABLE {qname}{spec}{clauses};"
             )
             return header + create + "\n\n" + flow + "\n"
-        if mat in ("auto_cdc", "auto_cdc_snapshot"):
-            return self._emit_auto_cdc(model, snapshot=(mat == "auto_cdc_snapshot"),
-                                       header=header, spec=spec, clauses=clauses)
         raise CompilationError(f"{model.name}: cannot emit materialization {mat!r}")
 
     def _into_target(self, model: Model) -> str:
@@ -286,7 +296,7 @@ class Compiler:
         priv = "PRIVATE " if cfg.private else ""
         if not cfg.keys:
             raise CompilationError(
-                f"{model.name}: auto_cdc/snapshot requires `keys` (e.g. keys=['id'])"
+                f"{model.name}: flow='auto_cdc' requires `keys` (e.g. keys=['id'])"
             )
         into = self._into_target(model) if cfg.into else qname
         once = "ONCE " if cfg.once else ""
@@ -305,7 +315,7 @@ class Compiler:
         else:
             if not cfg.sequence_by:
                 raise CompilationError(
-                    f"{model.name}: auto_cdc requires `sequence_by` "
+                    f"{model.name}: flow='auto_cdc' requires `sequence_by` "
                     f"(e.g. sequence_by='updated_at')"
                 )
             # FROM takes an identifier, not a subquery -> stage via temp view
@@ -355,36 +365,113 @@ class Compiler:
 
     # -- public API ----------------------------------------------------------
 
-    def resolve_datasets(self, selector: str) -> List[str]:
+    def resolve_datasets(self, selector: str,
+                         within: Optional[Set[str]] = None) -> List[str]:
         """Selector(s) -> dataset names, for --refresh/--full-refresh flags.
 
         Accepts comma- or space-separated dbt selectors (`a`, `+a`, `a+`,
-        `tag:t`, `resource_type:seed`). Ephemeral nodes have no dataset and
-        are dropped.
+        `tag:t`, `resource_type:seed`, `path:d`, `source:s`). Ephemeral and
+        flow-only (`into:`) nodes have no dataset and are dropped. ``within``
+        restricts to a pipeline's emitted set.
         """
         names: List[str] = []
         for tok in re.split(r"[,\s]+", selector.strip()):
             if not tok:
                 continue
             for n in self.graph.select(tok):
+                if within is not None and n not in within:
+                    continue
                 m = self.parsed.models[n]
                 if not m.is_ephemeral and not m.config.into:
                     names.append(m.qualified_name)
         deduped = list(dict.fromkeys(names))
-        if not deduped:
+        if not deduped and within is None:
             raise CompilationError(f"selector {selector!r} matched no datasets")
         return deduped
 
-    def compile(self, select: Optional[str] = None,
-                target_dir: Optional[Path] = None) -> CompileResult:
-        selected_names = self.graph.select(select)
-        # compile closes over ancestors: the emitted pipeline must be
-        # self-contained since datasets resolve by name at validation time
-        order = self.graph.topo_order(selected_names)
-        selected = set(order)
+    # -- multi-pipeline compilation ------------------------------------------
+
+    def pipeline_assignments(self) -> "Dict[str, Set[str]]":
+        """pipeline name -> model names it owns (empty when `pipelines:` unset).
+
+        Raises on overlap: a non-ephemeral dataset may be created by exactly
+        one pipeline, or two `spark-pipelines` deployments will fight over
+        the same table.
+        """
+        assigned: Dict[str, Set[str]] = {}
+        owner: Dict[str, str] = {}
+        for pname, selector in self.project.pipelines.items():
+            sel = set(self.graph.select(selector))
+            for n in sorted(sel):
+                m = self.parsed.models[n]
+                if m.is_ephemeral:
+                    continue
+                if n in owner:
+                    raise CompilationError(
+                        f"model {n!r} is selected by pipelines {owner[n]!r} "
+                        f"and {pname!r} — a dataset can be owned by only one "
+                        f"pipeline"
+                    )
+                owner[n] = pname
+            assigned[pname] = sel
+        # coverage: a dataset upstream of a pipeline member but in no
+        # pipeline will never be created — flag it
+        covered = set(owner)
+        for pname, sel in assigned.items():
+            for n in sorted(sel):
+                for a in self.graph.ancestors(n):
+                    am = self.parsed.models[a]
+                    if not am.is_ephemeral and a not in covered:
+                        self.warnings.append(
+                            f"pipeline {pname!r}: {n!r} refs {a!r}, which is "
+                            f"assigned to no pipeline — it resolves to "
+                            f"{am.qualified_name} as an external read"
+                        )
+        return assigned
+
+    def compile_pipelines(
+        self, select: Optional[str] = None,
+        pipeline: Optional[List[str]] = None,
+        target_dir: Optional[Path] = None,
+    ) -> "Dict[str, CompileResult]":
+        """Compile every pipeline (or the named subset) to its own spec dir.
+
+        With no `pipelines:` config this is the single-pipeline path: one
+        spec at ``target_dir`` containing the --select closure. With
+        `pipelines:` each entry emits ``target_dir/pipelines/<name>/``.
+        """
+        root_target = Path(target_dir or (self.project.root / self.project.target_path))
+        if not self.project.pipelines:
+            return {self.project.name: self._compile_one(
+                self.graph.topo_order(self.graph.select(select)),
+                root_target, self.project.name)}
+
+        assigned = self.pipeline_assignments()
+        results: Dict[str, CompileResult] = {}
+        for pname, sel in assigned.items():
+            if pipeline and pname not in pipeline:
+                continue
+            if select:
+                # CLI narrowing: keep the selected slice of this pipeline
+                sel &= set(self.graph.topo_order(self.graph.select(select)))
+            order = [n for n in self.graph.topo_order() if n in sel]
+            results[pname] = self._compile_one(
+                order, root_target / "pipelines" / pname, pname)
+        if not results:
+            raise CompilationError(
+                f"no pipelines matched {pipeline!r}; defined: "
+                f"{', '.join(self.project.pipelines)}"
+            )
+        return results
+
+    def _compile_one(self, order: List[str], target: Path,
+                     spec_name: str) -> CompileResult:
+        """Emit one pipeline's definitions + spec + manifest for ``order``."""
+        self._emitted = set(order)
+        self._stream_views = set()
         for n in order:
             if self.parsed.models[n].materialization == "streaming_table":
-                for a in self.graph.ancestors(n) & selected:
+                for a in self.graph.ancestors(n) & self._emitted:
                     am = self.parsed.models[a]
                     if am.materialization in ("view", "temporary_view"):
                         if am.materialization == "view":
@@ -393,7 +480,6 @@ class Compiler:
                                 f"TEMPORARY VIEW (published views can't be streaming sources)"
                             )
                         self._stream_views.add(a)
-        target = Path(target_dir or (self.project.root / self.project.target_path))
         defs = target / "definitions"
         defs.mkdir(parents=True, exist_ok=True)
         for stale in defs.glob("*.sql"):
@@ -412,16 +498,31 @@ class Compiler:
             files.append(f)
             nodes[name] = _manifest_node(model, emitted=str(f.relative_to(target)))
 
-        spec = self._write_spec(target)
+        spec = self._write_spec(target, spec_name)
         manifest = self._write_manifest(target, nodes)
-        self.warnings = sorted(set(self.warnings))
         return CompileResult(target_dir=target, spec_file=spec,
                              manifest_file=manifest, files=files,
                              warnings=self.warnings)
 
-    def _write_spec(self, target: Path) -> Path:
+    def compile(self, select: Optional[str] = None,
+                target_dir: Optional[Path] = None) -> CompileResult:
+        """Compile everything and merge into one result (back-compat API)."""
+        results = self.compile_pipelines(select=select, target_dir=target_dir)
+        merged_files: List[Path] = []
+        for r in results.values():
+            merged_files.extend(r.files)
+        root_target = Path(target_dir or (self.project.root / self.project.target_path))
+        first = next(iter(results.values()))
+        self.warnings = sorted(set(self.warnings))
+        return CompileResult(target_dir=first.target_dir if len(results) == 1 else root_target,
+                             spec_file=first.spec_file,
+                             manifest_file=first.manifest_file,
+                             files=merged_files,
+                             warnings=self.warnings)
+
+    def _write_spec(self, target: Path, name: str) -> Path:
         spec: Dict = {
-            "name": self.project.name,
+            "name": name,
             "libraries": [{"glob": {"include": "definitions/**"}}],
         }
         storage = self.project.storage or f"file://{(target / 'storage').resolve()}"

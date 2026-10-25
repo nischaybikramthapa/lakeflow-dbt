@@ -106,7 +106,7 @@ def test_into_requires_flow_materialization(tmp_project):
         "models/b.sql": "{{ config(materialized='table', into='a') }}\nselect 1 as id\n",
     })
     p = parse_project(load_project(str(root)))
-    with pytest.raises(CompilationError, match="into.*flow materialization"):
+    with pytest.raises(CompilationError, match="into.*streaming table"):
         Compiler(load_project(str(root)), p).compile(target_dir=root / "t1")
 
 
@@ -118,6 +118,76 @@ def test_into_unknown_target_rejected(tmp_project):
     })
     with pytest.raises(ParseError, match="ghost"):
         parse_project(load_project(str(root)))
+
+
+# --- multi-pipeline projects ---------------------------------------------------
+
+from pathlib import Path as _Path
+
+LAYERED = _Path(__file__).resolve().parents[1] / "examples" / "layered_shop"
+
+
+def layered():
+    p = load_project(str(LAYERED))
+    return p, parse_project(p)
+
+
+def test_pipelines_config_and_dirs():
+    project, parsed = layered()
+    assert set(project.pipelines) == {"bronze", "gold"}
+    c = Compiler(project, parsed)
+    a = c.pipeline_assignments()
+    assert a["bronze"] == {"orders_st", "customers_cdc", "status_codes"}
+    assert a["gold"] == {"customer_orders", "daily_revenue"}
+
+
+def test_pipelines_emit_separate_specs(tmp_path):
+    project, parsed = layered()
+    results = Compiler(project, parsed).compile_pipelines(target_dir=tmp_path)
+    assert set(results) == {"bronze", "gold"}
+    for pname, res in results.items():
+        spec = res.target_dir / "spark-pipeline.yml"
+        assert spec.exists()
+        assert f"name: {pname}" in spec.read_text()
+
+
+def test_cross_pipeline_ref_is_batch_read(tmp_path):
+    project, parsed = layered()
+    results = Compiler(project, parsed).compile_pipelines(target_dir=tmp_path)
+    gold = {f.stem: f.read_text() for f in results["gold"].files}
+    # orders_st/customers_cdc are bronze-owned: plain reads, no STREAM
+    assert "from orders_st" in gold["customer_orders"]
+    assert "STREAM(" not in gold["customer_orders"]
+    # and the upstream datasets are NOT emitted into gold
+    assert "orders_st" not in gold
+    bronze = {f.stem: f.read_text() for f in results["bronze"].files}
+    assert "CREATE OR REFRESH STREAMING TABLE orders_st" in bronze["orders_st"]
+
+
+def test_pipeline_overlap_rejected(tmp_project):
+    root = tmp_project({
+        "lakeflow_project.yml": "name: t\npipelines:\n  a: staging\n  b: staging\n",
+        "models/staging/x.sql": "select 1 as id\n",
+    })
+    p = parse_project(load_project(str(root)))
+    with pytest.raises(CompilationError, match="only one pipeline"):
+        Compiler(load_project(str(root)), p).compile_pipelines(target_dir=root / "t")
+
+
+def test_dir_and_source_selectors(project, parsed):
+    g = Compiler(project, parsed).graph
+    assert set(g.select("staging")) == {"stg_customers", "stg_orders", "order_item_totals"}
+    assert set(g.select("path:marts")) >= {"customers", "order_events"}
+    assert set(g.select("source:raw.orders")) == {"stg_orders"}
+
+
+def test_pipeline_flag_compiles_subset(project, parsed, tmp_path):
+    # single-pipeline example: --pipeline names must match nothing -> error only
+    # when pipelines are defined; here they aren't so it's ignored
+    project, parsed = layered()
+    results = Compiler(project, parsed).compile_pipelines(
+        pipeline=["gold"], target_dir=tmp_path)
+    assert set(results) == {"gold"}
 
 
 # --- selective refresh ---------------------------------------------------------

@@ -1,0 +1,10 @@
+version: 2
+
+sources:
+  - name: raw
+    schema: raw_data
+    tables:
+      - name: orders
+        streaming: true
+      - name: customers_feed
+        streaming: true

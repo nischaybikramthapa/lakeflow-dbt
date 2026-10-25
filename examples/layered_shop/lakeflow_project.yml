@@ -1,0 +1,22 @@
+name: layered_shop
+catalog: main
+schema: layered_shop
+# storage: /Volumes/main/layered_shop/_checkpoints
+
+model-paths: [models]
+seed-paths: [seeds]
+target-path: target
+
+# One project -> several pipelines. Each key becomes its own
+# spark-pipeline.yml under target/pipelines/<name>/ and deploys as a
+# separate pipeline in the Lakeflow UI. Values are dbt-style selectors.
+pipelines:
+  # source-system ingestion: streaming tables + AUTO CDC off raw feeds
+  bronze: "ingestion resource_type:seed"
+  # the data product: everything under models/marts/
+  gold: marts
+
+models:
+  layered_shop:
+    ingestion: {+materialized: incremental}
+    marts: {+materialized: table}

@@ -56,7 +56,28 @@ def load_project(start: Optional[str] = None, vars_override: Optional[Dict[str, 
         model_tree=raw.get("models") or {},
         seed_paths=list(raw.get("seed-paths", ["seeds"])),
         seed_tree=raw.get("seeds") or {},
+        pipelines=_pipelines_map(raw.get("pipelines")),
     )
+
+
+def _pipelines_map(raw) -> Dict[str, str]:
+    """`pipelines:` -> {name: selector}. Values may be a selector string or a
+    mapping with a `select` key (room for per-pipeline options later)."""
+    if not raw:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError("`pipelines:` must be a mapping of name -> selector")
+    out = {}
+    for pname, val in raw.items():
+        if isinstance(val, str):
+            out[pname] = val
+        elif isinstance(val, dict) and isinstance(val.get("select"), str):
+            out[pname] = val["select"]
+        else:
+            raise ConfigError(
+                f"pipelines.{pname}: expected a selector string or {{select: ...}}"
+            )
+    return out
 
 
 def dir_default_config(project: Project, fqn_dir: str,
