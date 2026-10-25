@@ -15,6 +15,8 @@ MATERIALIZATIONS = {
     "temporary_view": "temporary_view",
     "table": "materialized_view",
     "incremental": "streaming_table",
+    "auto_cdc": "auto_cdc",
+    "snapshot": "auto_cdc_snapshot",
     "ephemeral": "cte",
 }
 # Aliases accepted in {{ config(materialized=...) }}
@@ -23,6 +25,18 @@ MATERIALIZATION_ALIASES = {
     "mv": "table",
     "streaming_table": "incremental",
     "stream": "incremental",
+    "apply_changes": "auto_cdc",
+    "scd2": "snapshot",
+    "scd_type_2": "snapshot",
+}
+
+#: stored_as value -> SQL
+STORED_AS = {
+    "scd_type_1": "SCD TYPE 1",
+    "scd_type_2": "SCD TYPE 2",
+    "scd1": "SCD TYPE 1",
+    "scd2": "SCD TYPE 2",
+    "bitemporal": "BITEMPORAL",
 }
 
 VALID_VIOLATIONS = {"warn", "drop", "fail"}
@@ -43,6 +57,17 @@ class ModelConfig:
     # default ON VIOLATION action for this model's tests: warn|drop|fail
     on_violation: str = "warn"
     private: bool = False
+    # AUTO CDC / snapshot flow options
+    keys: List[str] = field(default_factory=list)
+    sequence_by: Any = None            # str column or list -> STRUCT(...)
+    stored_as: Optional[str] = None    # scd_type_1 | scd_type_2 | bitemporal
+    track_history: Any = None          # list of cols, {'except': [...]}, or '*'
+    columns: Any = None                # list of cols or {'except': [...]}
+    apply_as_deletes: Optional[str] = None
+    apply_as_truncates: Optional[str] = None
+    ignore_null_updates: Any = None    # bool or column list
+    version: Optional[str] = None      # snapshot only: WITH VERSION expression
+    once: bool = False                 # AUTO CDC ONCE / one-time backfill
 
     def merged(self, other: Dict[str, Any]) -> "ModelConfig":
         """Return a copy with keys of ``other`` applied (dbt `+` config semantics)."""
@@ -119,6 +144,7 @@ class Model:
     fqn_dir: str = ""       # dir name under model-path root, for +materialized trees
     description: Optional[str] = None
     tests: List[ColumnTest] = field(default_factory=list)
+    resource_type: str = "model"   # 'model' | 'seed'
 
     @property
     def dataset_name(self) -> str:
@@ -151,6 +177,9 @@ class Project:
     configuration: Dict[str, Any]
     # raw `models:` tree from the project file, for +config resolution
     model_tree: Dict[str, Any]
+    seed_paths: List[str] = field(default_factory=list)
+    # raw `seeds:` tree for +config resolution
+    seed_tree: Dict[str, Any] = field(default_factory=dict)
 
     def base_config(self) -> ModelConfig:
         return ModelConfig()

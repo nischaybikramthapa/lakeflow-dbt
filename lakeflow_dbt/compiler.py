@@ -11,7 +11,7 @@ import yaml
 
 from .errors import CompilationError
 from .graph import Graph
-from .model import Model, Project
+from .model import MATERIALIZATIONS, STORED_AS, Model, Project
 from .parser import ParseResult, _REF_RE, _SRC_RE
 from .tests_map import compile_test
 
@@ -65,6 +65,18 @@ def _view_header_comment(model: Model) -> str:
     if model.description:
         return "-- " + model.description.replace("\n", "\n-- ") + "\n"
     return ""
+
+
+def _colspec(value, keyword: str) -> str:
+    """`COLUMNS`/`TRACK HISTORY ON`/`IGNORE NULL UPDATES ON` clause bodies."""
+    if value is None or value is False:
+        return ""
+    if value == "*" or value is True:
+        return f"{keyword} *"
+    if isinstance(value, dict) and "except" in value:
+        return f"{keyword} * EXCEPT ({', '.join(value['except'])})"
+    cols = value if isinstance(value, (list, tuple)) else [value]
+    return f"{keyword} ({', '.join(str(c) for c in cols)})"
 
 
 class Compiler:
@@ -180,7 +192,7 @@ class Compiler:
         qname = model.qualified_name
         priv = "PRIVATE " if model.config.private else ""
         spec = ""
-        if mat in ("materialized_view", "streaming_table"):
+        if mat in ("materialized_view", "streaming_table", "auto_cdc", "auto_cdc_snapshot"):
             constraints = self._constraints(model)
             if constraints:
                 spec = " (\n  " + ",\n  ".join(constraints) + "\n)"
@@ -226,9 +238,101 @@ class Compiler:
             body = self._body(model, streaming=True)
             flow = f"CREATE FLOW {model.dataset_name}_flow AS INSERT INTO {qname} BY NAME\n{body};"
             return header + create + "\n\n" + flow + "\n"
+        if mat in ("auto_cdc", "auto_cdc_snapshot"):
+            return self._emit_auto_cdc(model, snapshot=(mat == "auto_cdc_snapshot"),
+                                       header=header, spec=spec, clauses=clauses)
         raise CompilationError(f"{model.name}: cannot emit materialization {mat!r}")
 
+    def _emit_auto_cdc(self, model: Model, *, snapshot: bool,
+                       header: str, spec: str, clauses: str) -> str:
+        cfg = model.config
+        qname = model.qualified_name
+        priv = "PRIVATE " if cfg.private else ""
+        if not cfg.keys:
+            raise CompilationError(
+                f"{model.name}: auto_cdc/snapshot requires `keys` (e.g. keys=['id'])"
+            )
+        once = "ONCE " if cfg.once else ""
+        flow = [f"CREATE FLOW {model.dataset_name}_flow AS AUTO CDC {once}INTO {qname}"]
+        pre = ""
+        if snapshot:
+            body = self._body(model, streaming=False)
+            if cfg.sequence_by:
+                raise CompilationError(
+                    f"{model.name}: `sequence_by` is not valid for snapshot; "
+                    f"ordering comes from `version`"
+                )
+            flow.append(f"FROM SNAPSHOT (\n{_indent(body, '    ')}\n)")
+            if cfg.version:
+                flow.append(f"WITH VERSION ({cfg.version})")
+        else:
+            if not cfg.sequence_by:
+                raise CompilationError(
+                    f"{model.name}: auto_cdc requires `sequence_by` "
+                    f"(e.g. sequence_by='updated_at')"
+                )
+            # FROM takes an identifier, not a subquery -> stage via temp view
+            src_view = f"{model.dataset_name}__cdc"
+            body = self._body(model, streaming=False)
+            pre = f"CREATE TEMPORARY VIEW {src_view}\nAS\n{body};\n\n"
+            flow.append(f"FROM STREAM({src_view})")
+        flow.append(f"KEYS ({', '.join(cfg.keys)})")
+        if cfg.ignore_null_updates:
+            if cfg.ignore_null_updates is True:
+                flow.append("IGNORE NULL UPDATES")
+            else:
+                v = cfg.ignore_null_updates
+                if isinstance(v, dict) and "except" in v:
+                    flow.append(f"IGNORE NULL UPDATES ON * EXCEPT ({', '.join(v['except'])})")
+                else:
+                    cols = v if isinstance(v, (list, tuple)) else [v]
+                    flow.append(f"IGNORE NULL UPDATES ON {', '.join(cols)}")
+        if cfg.apply_as_deletes:
+            flow.append(f"APPLY AS DELETE WHEN {cfg.apply_as_deletes}")
+        if cfg.apply_as_truncates:
+            flow.append(f"APPLY AS TRUNCATE WHEN {cfg.apply_as_truncates}")
+        if not snapshot:
+            seq = cfg.sequence_by
+            seq_sql = f"STRUCT({', '.join(seq)})" if isinstance(seq, (list, tuple)) else str(seq)
+            flow.append(f"SEQUENCE BY {seq_sql}")
+            cols = _colspec(cfg.columns, "COLUMNS")
+            if cols:
+                flow.append(cols)
+        if cfg.stored_as:
+            sa = STORED_AS.get(str(cfg.stored_as).lower())
+            if not sa:
+                raise CompilationError(
+                    f"{model.name}: unknown stored_as {cfg.stored_as!r}; "
+                    f"expected one of {sorted(STORED_AS)}"
+                )
+            flow.append(f"STORED AS {sa}")
+        th = _colspec(cfg.track_history, "TRACK HISTORY ON")
+        if th:
+            flow.append(th)
+        create = f"CREATE OR REFRESH {priv}STREAMING TABLE {qname}{spec}{clauses};"
+        return header + pre + create + "\n\n" + "\n".join(flow) + ";\n"
+
     # -- public API ----------------------------------------------------------
+
+    def resolve_datasets(self, selector: str) -> List[str]:
+        """Selector(s) -> dataset names, for --refresh/--full-refresh flags.
+
+        Accepts comma- or space-separated dbt selectors (`a`, `+a`, `a+`,
+        `tag:t`, `resource_type:seed`). Ephemeral nodes have no dataset and
+        are dropped.
+        """
+        names: List[str] = []
+        for tok in re.split(r"[,\s]+", selector.strip()):
+            if not tok:
+                continue
+            for n in self.graph.select(tok):
+                m = self.parsed.models[n]
+                if not m.is_ephemeral:
+                    names.append(m.qualified_name)
+        deduped = list(dict.fromkeys(names))
+        if not deduped:
+            raise CompilationError(f"selector {selector!r} matched no datasets")
+        return deduped
 
     def compile(self, select: Optional[str] = None,
                 target_dir: Optional[Path] = None) -> CompileResult:
@@ -315,6 +419,7 @@ class Compiler:
 def _manifest_node(model: Model, emitted: Optional[str]) -> Dict:
     return {
         "name": model.name,
+        "resource_type": model.resource_type,
         "dataset": model.qualified_name,
         "path": str(model.rel_path),
         "materialization": model.materialization,

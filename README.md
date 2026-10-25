@@ -22,6 +22,7 @@ lfd init my_lake            # scaffold a project
 cd my_lake
 lfd parse                   # validate models + graph
 lfd compile                 # emit target/definitions/*.sql + spark-pipeline.yml
+lfd seed                    # compile only seed CSVs
 lfd run --dry-run           # spark-pipelines dry-run (needs pyspark[pipelines])
 ```
 
@@ -63,6 +64,9 @@ models:
 | `materialized='incremental'`   | `CREATE OR REFRESH STREAMING TABLE` + `CREATE FLOW ... INSERT INTO ... BY NAME` |
 | `materialized='ephemeral'`     | inlined as a `WITH` CTE into each dependent                   |
 | `materialized='temp_view'`     | `CREATE TEMPORARY VIEW`                                       |
+| `materialized='auto_cdc'`      | `TEMPORARY VIEW` staging + `STREAMING TABLE` + `CREATE FLOW ... AUTO CDC INTO ... FROM STREAM` |
+| `materialized='snapshot'`      | `STREAMING TABLE` + `CREATE FLOW ... AUTO CDC ... FROM SNAPSHOT (query) WITH VERSION (expr)` |
+| seed CSVs under `seed-paths`   | `CREATE OR REFRESH MATERIALIZED VIEW` over a `VALUES` literal (types inferred) |
 | `{{ ref('m') }}`               | dataset name; `STREAM(name)` inside flows when upstream is streaming |
 | `{{ source('s','t') }}`        | `catalog.schema.table` from `sources:`; `STREAM(...)` when flagged `streaming: true` and read inside a flow |
 | `not_null` test                | `CONSTRAINT ... EXPECT (col IS NOT NULL)`                     |
@@ -72,7 +76,9 @@ models:
 | `description`                  | `COMMENT '...'`                                               |
 | `cluster_by`, `partition_cols`, `tblproperties` | `CLUSTER BY` / `PARTITIONED BY` / `TBLPROPERTIES` clauses |
 | `on_violation: warn/drop/fail` | plain `EXPECT` / `ON VIOLATION DROP ROW` / `FAIL UPDATE`      |
-| `--select m / +m / m+ / tag:t` | dbt-style selection; `compile` also pulls in ancestors so the emitted pipeline is self-contained |
+| `keys`, `sequence_by`, `stored_as`, `track_history`, `apply_as_deletes/truncates`, `ignore_null_updates`, `columns`, `once` | `AUTO CDC INTO` clauses on the flow |
+| `version` (snapshot)           | `WITH VERSION (expr)` for ordering snapshots                   |
+| `--select m / +m / m+ / tag:t / resource_type:seed` | dbt-style selection; `compile` also pulls in ancestors so the emitted pipeline is self-contained |
 | `{{ var('x') }}` / `--vars`    | project `vars:` + CLI overrides                                |
 | `macros/`                      | Jinja `{% import %}`/`{% include %}` from `macro-paths`        |
 
@@ -84,6 +90,7 @@ catalog: main            # -> spec catalog
 schema: jaffle_lake      # -> spec database
 storage: /Volumes/...    # -> spec storage (streaming checkpoints)
 model-paths: [models]
+seed-paths: [seeds]
 target-path: target
 vars: {currency: USD}
 configuration:           # -> spec Spark conf
@@ -92,7 +99,24 @@ models:
   jaffle_lake:
     staging: {+materialized: view}
     marts:   {+materialized: table, +on_violation: drop}
+seeds:                   # optional +config tree, same shape as models:
+  jaffle_lake: {+materialized: table}
 ```
+
+## AUTO CDC / snapshots (dbt `snapshot`, done declaratively)
+
+```sql
+{{ config(materialized='auto_cdc', keys=['customer_id'],
+          sequence_by='updated_at', stored_as='scd_type_2',
+          track_history={'except': ['updated_at']},
+          apply_as_deletes="op = 'DELETE'") }}
+select * from {{ source('raw', 'customers_feed') }}
+```
+
+`auto_cdc` expects a change feed (`op`/`updated_at` style rows) and emits
+`AUTO CDC INTO ... FROM STREAM(<staging temp view>)`. `snapshot` expects
+periodic full snapshots and emits `AUTO CDC ... FROM SNAPSHOT (query)`
+(`version` orders the snapshots; `sequence_by` is rejected).
 
 ## Running on Databricks
 
@@ -101,8 +125,18 @@ models:
 
 ```bash
 lfd run --select marts+ -- --conf spark.sql.shuffle.partitions=400
-lfd run --full-refresh order_events --remote sc://cluster:15002
+
+# selective refresh — selectors resolve to dataset names:
+lfd refresh --select order_events+          # incremental update of a subgraph
+lfd run --refresh 'order_events,tag:gold'   # same, via run
+lfd run --full-refresh 'order_events+'      # reset + recompute
+lfd run --full-refresh-all
 ```
+
+`--refresh`/`--full-refresh` take the same selectors as `--select` (names,
+`+a`, `a+`, `tag:x`, `resource_type:seed`) — the spec is compiled in full so
+every dataset name resolves, and the flags become
+`spark-pipelines run --refresh ds1,ds2`.
 
 Or take `target/` (spec + `definitions/`) into your own bundle/job — point the
 pipeline's libraries at `definitions/**`.
@@ -116,6 +150,8 @@ pipeline's libraries at `definitions/**`.
   `unique` don't fit the declarative model and produce warnings.
 - **`--select` semantics are for `ls`.** `compile`/`run` always close over
   ancestors — a pipeline spec must resolve every dataset name it references.
+  Refreshes are the selective operation: `--refresh`/`--full-refresh` pick the
+  datasets to update inside a fully compiled spec.
 
 ## Tests
 

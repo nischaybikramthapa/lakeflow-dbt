@@ -20,6 +20,7 @@ from .model import (
     SourceTable,
 )
 from .project import model_config_for
+from .seeds import load_seeds
 
 REF_MARKER = '__LFD_REF__("{}")'
 SRC_MARKER = '__LFD_SRC__("{}")'
@@ -199,10 +200,12 @@ def _parse_schema_file(path: Path, result: ParseResult) -> None:
 def parse_project(project: Project) -> ParseResult:
     result = ParseResult()
 
+    missing_paths = []
     for mpath in project.model_paths:
         mroot = project.root / mpath
         if not mroot.is_dir():
-            raise ConfigError(f"model path {mroot} does not exist")
+            missing_paths.append(mpath)
+            continue
         for path in sorted(mroot.rglob("*.sql")):
             model = _render_model(project, path, mroot)
             if model.name in result.models:
@@ -215,6 +218,21 @@ def parse_project(project: Project) -> ParseResult:
             if path.name in PROJECT_FILES_HINTS:
                 continue
             _parse_schema_file(path, result)
+
+    for seed in load_seeds(project):
+        if seed.name in result.models:
+            raise ParseError(
+                f"duplicate node name {seed.name!r}: {seed.abs_path} and "
+                f"{result.models[seed.name].abs_path}"
+            )
+        result.models[seed.name] = seed
+
+    if not result.models:
+        raise ConfigError(
+            "no models or seeds found; looked in model-paths "
+            f"{project.model_paths} (missing: {missing_paths or 'none'}) "
+            f"and seed-paths {project.seed_paths}"
+        )
 
     # apply schema.yml metadata to models
     for mname, meta in result.model_meta.items():

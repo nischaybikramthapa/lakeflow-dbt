@@ -1,0 +1,5 @@
+status,label,sort_order
+placed,Placed,1
+shipped,Shipped,2
+completed,Completed,3
+returned,Returned,4

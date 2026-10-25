@@ -90,6 +90,11 @@ class Graph:
                 seeds = [n for n, m in self.models.items() if tag in (m.config.tags or [])]
                 if not seeds:
                     raise GraphError(f"no models with tag {tag!r}")
+            elif core.startswith("resource_type:") or core.startswith("type:"):
+                rt = core.split(":", 1)[1]
+                seeds = [n for n, m in self.models.items() if m.resource_type == rt]
+                if not seeds:
+                    raise GraphError(f"no nodes with resource_type {rt!r}")
             else:
                 if core not in self.models:
                     raise GraphError(f"selector {core!r} matches no model")

@@ -54,16 +54,20 @@ def load_project(start: Optional[str] = None, vars_override: Optional[Dict[str, 
         vars=merged_vars,
         configuration=dict(raw.get("configuration") or {}),
         model_tree=raw.get("models") or {},
+        seed_paths=list(raw.get("seed-paths", ["seeds"])),
+        seed_tree=raw.get("seeds") or {},
     )
 
 
-def dir_default_config(project: Project, fqn_dir: str) -> Dict[str, Any]:
-    """Resolve the ``models:`` config tree for a subdirectory, dbt `+key` style.
+def dir_default_config(project: Project, fqn_dir: str,
+                       tree: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Resolve a config tree for a subdirectory, dbt `+key` style.
 
-    ``models:`` keys without a ``+`` are directory names; ``+key`` entries are
-    configs applied to every model under that directory.
+    ``models:``/``seeds:`` keys without a ``+`` are directory names; ``+key``
+    entries are configs applied to every node under that directory.
     """
-    tree = project.model_tree.get(project.name, {}) or {}
+    if tree is None:
+        tree = project.model_tree.get(project.name, {}) or {}
     out: Dict[str, Any] = {}
     node: Dict[str, Any] = tree
 
@@ -82,10 +86,11 @@ def dir_default_config(project: Project, fqn_dir: str) -> Dict[str, Any]:
     return out
 
 
-def model_config_for(project: Project, fqn_dir: str, inline: Dict[str, Any]) -> ModelConfig:
-    """Final config for one model: defaults <- dir tree <- inline {{ config() }}."""
+def model_config_for(project: Project, fqn_dir: str, inline: Dict[str, Any],
+                     tree: Optional[Dict[str, Any]] = None) -> ModelConfig:
+    """Final config for one node: defaults <- dir tree <- inline {{ config() }}."""
     base = project.base_config()
     try:
-        return base.merged(dir_default_config(project, fqn_dir)).merged(inline)
+        return base.merged(dir_default_config(project, fqn_dir, tree)).merged(inline)
     except ValueError as e:
         raise ConfigError(f"{fqn_dir}: {e}") from e

@@ -5,6 +5,9 @@ sources:
     schema: raw_data
     tables:
       - name: customers
+      - name: customers_feed   # CDC event feed (op + updated_at) -> auto_cdc
+        streaming: true
+      - name: inventory        # periodic full snapshots -> snapshot materialization
       - name: orders
         streaming: true        # append-only order feed -> STREAM() reads
       - name: payments
@@ -43,3 +46,12 @@ models:
           - not_null:
               config:
                 on_violation: fail
+
+  - name: customers_scd2
+    description: Customer dimension with full SCD2 history via AUTO CDC.
+
+  - name: inventory_snapshot
+    description: Inventory levels diffed across periodic snapshots.
+
+  - name: order_status_map
+    description: Seed CSV -> materialized view of status labels.

@@ -133,17 +133,55 @@ def cmd_ls(args) -> int:
     return 0
 
 
+def cmd_seed(args) -> int:
+    """dbt `seed` analogue: compile only the seed CSVs."""
+    project, parsed = _load(args)
+    seeds = [n for n, m in parsed.models.items() if m.resource_type == "seed"]
+    if not seeds:
+        print("no seeds found under seed-paths")
+        return 0
+    result = Compiler(project, parsed).compile(select="resource_type:seed")
+    _print_warnings(result.warnings)
+    print(f"Compiled {len(result.files)} seed dataset(s) -> {result.target_dir}/definitions")
+    for f in result.files:
+        print(f"  {f.relative_to(result.target_dir)}")
+    return 0
+
+
+def _refresh_cmd(args, compiler: Compiler) -> list:
+    """Translate --refresh/--full-refresh selectors into spark-pipelines args."""
+    if args.full_refresh_all and (args.refresh or args.full_refresh):
+        raise LakeflowDbtError(
+            "--full-refresh-all can't be combined with --refresh/--full-refresh"
+        )
+    out: list = []
+    if args.refresh:
+        ds = compiler.resolve_datasets(args.refresh)
+        out += ["--refresh", ",".join(ds)]
+    if args.full_refresh:
+        ds = compiler.resolve_datasets(args.full_refresh)
+        out += ["--full-refresh", ",".join(ds)]
+    if args.full_refresh_all:
+        out += ["--full-refresh-all"]
+    return out
+
+
 def cmd_run(args) -> int:
     project, parsed = _load(args)
-    result = Compiler(project, parsed).compile(select=args.select)
+    compiler = Compiler(project, parsed)
+    # `lfd refresh --select x` == `lfd run --refresh x`
+    if getattr(args, "refresh_selector", False) and not (args.refresh or args.full_refresh):
+        args.refresh = args.select
+    # when refresh selectors are given the spec must contain every dataset:
+    # compile the whole project, not a --select-trimmed subset
+    has_refresh = args.refresh or args.full_refresh or args.full_refresh_all
+    select = None if has_refresh else args.select
+    result = compiler.compile(select=select)
     _print_warnings(result.warnings)
 
     tool = "dry-run" if args.dry_run else "run"
     cmd = ["spark-pipelines", tool, "--spec", str(result.spec_file)]
-    for refresh in args.full_refresh or []:
-        cmd += ["--full-refresh", refresh]
-    if args.full_refresh_all:
-        cmd += ["--full-refresh-all"]
+    cmd += _refresh_cmd(args, compiler)
     cmd += args.spark_args or []
 
     if shutil.which("spark-pipelines") is None:
@@ -175,20 +213,29 @@ def build_parser() -> argparse.ArgumentParser:
     for name, help_ in (
         ("compile", "compile models to declarative pipeline SQL + spec"),
         ("run", "compile, then run the pipeline via `spark-pipelines`"),
+        ("refresh", "compile, then selectively update datasets (--refresh)"),
         ("ls", "list models"),
     ):
         s = sub.add_parser(name, help=help_)
         s.add_argument("--select", help="dbt-style selection: `+a b+ tag:x`")
         s.add_argument("--vars", help="inline JSON/YAML map of vars for {{ var() }}")
-        s.set_defaults(fn={"compile": cmd_compile, "run": cmd_run, "ls": cmd_ls}[name])
-        if name == "run":
+        s.set_defaults(fn={"compile": cmd_compile, "run": cmd_run,
+                           "refresh": cmd_run, "ls": cmd_ls}[name])
+        if name == "refresh":
+            s.set_defaults(refresh_selector=True)
+        if name in ("run", "refresh"):
             s.add_argument("--dry-run", action="store_true",
                            help="run `spark-pipelines dry-run` instead")
-            s.add_argument("--full-refresh", action="append",
-                           help="dataset(s) to fully refresh (repeatable)")
+            s.add_argument("--refresh",
+                           help="selectors of datasets to update, e.g. `marts+ tag:x`")
+            s.add_argument("--full-refresh",
+                           help="selectors of datasets to reset and recompute")
             s.add_argument("--full-refresh-all", action="store_true")
             s.add_argument("spark_args", nargs=argparse.REMAINDER,
                            help="extra args passed to spark-pipelines (after --)")
+    s = sub.add_parser("seed", help="compile seed CSVs under seed-paths")
+    s.add_argument("--vars", help="inline JSON/YAML map")
+    s.set_defaults(fn=cmd_seed)
     return p
 
 

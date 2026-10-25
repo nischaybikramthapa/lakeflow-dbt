@@ -26,7 +26,9 @@ def test_example_project_parses(project, parsed):
     assert set(parsed.models) == {
         "stg_customers", "stg_orders", "order_item_totals",
         "customers", "order_events", "daily_revenue",
+        "customers_scd2", "inventory_snapshot", "order_status_map",
     }
+    assert parsed.models["order_status_map"].resource_type == "seed"
     assert parsed.sources["raw.orders"].streaming is True
     assert parsed.sources["raw.customers"].streaming is False
 
