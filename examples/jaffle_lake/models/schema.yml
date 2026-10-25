@@ -1,0 +1,45 @@
+version: 2
+
+sources:
+  - name: raw
+    schema: raw_data
+    tables:
+      - name: customers
+      - name: orders
+        streaming: true        # append-only order feed -> STREAM() reads
+      - name: payments
+        streaming: true
+
+models:
+  - name: stg_customers
+    description: Cleaned customer records from the raw feed.
+    columns:
+      - name: customer_id
+        tests: [not_null, unique]   # unique can't be an expectation -> warning
+
+  - name: stg_orders
+    description: Orders, one row per order.
+    columns:
+      - name: order_id
+        tests: [not_null]
+      - name: status
+        tests:
+          - accepted_values:
+              values: ['placed', 'shipped', 'completed', 'returned']
+
+  - name: customers
+    description: Customer dimension, one row per customer.
+    config:
+      tags: [finance]
+    columns:
+      - name: customer_id
+        tests: [not_null]
+
+  - name: order_events
+    description: Incremental order event stream.
+    columns:
+      - name: order_id
+        tests:
+          - not_null:
+              config:
+                on_violation: fail

@@ -1,0 +1,22 @@
+name: jaffle_lake
+version: '0.1'
+
+# Pipeline-level settings -> emitted into target/spark-pipeline.yml
+catalog: main
+schema: jaffle_lake
+# storage: /Volumes/main/jaffle_lake/_checkpoints
+
+model-paths: [models]
+target-path: target
+
+vars:
+  currency: 'USD'
+
+# Per-directory default configs (dbt `+key` semantics)
+models:
+  jaffle_lake:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table
+      +on_violation: drop

@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lakeflow-dbt"
+version = "0.1.0"
+description = "A dbt-style developer experience that compiles to Lakeflow Declarative Pipelines (Spark Declarative Pipelines)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "jinja2>=3.0",
+    "pyyaml>=5.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+lakeflow-dbt = "lakeflow_dbt.cli:main"
+lfd = "lakeflow_dbt.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["lakeflow_dbt*"]
