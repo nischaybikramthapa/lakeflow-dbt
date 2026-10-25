@@ -11,7 +11,7 @@ import yaml
 
 from .errors import CompilationError
 from .graph import Graph
-from .model import MATERIALIZATIONS, STORED_AS, Model, Project
+from .model import STORED_AS, Model, Project
 from .parser import ParseResult, _REF_RE, _SRC_RE
 from .tests_map import compile_test
 
