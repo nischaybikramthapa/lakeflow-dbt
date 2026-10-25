@@ -1,0 +1,33 @@
+# Databricks Asset Bundle deploying BOTH pipelines this project compiles.
+#
+#   lfd compile                          # target/pipelines/{bronze,gold}/
+#   databricks bundle deploy             # creates TWO pipelines in the UI:
+#                                        #   "layered_shop_bronze" + "layered_shop_gold"
+#   databricks bundle run layered_shop_bronze   # update just the ingestion layer
+#   databricks bundle run layered_shop_gold     # update just the data product
+#
+# Each pipelines: entry = one Lakeflow pipeline. One dbt-style project,
+# several deployable pipelines — same as one spec per pipeline, just
+# generated from one codebase.
+bundle:
+  name: layered_shop
+
+resources:
+  pipelines:
+    layered_shop_bronze:                       # source-system ingestion layer
+      name: layered_shop_bronze
+      catalog: main
+      schema: layered_shop
+      serverless: true
+      libraries:
+        - glob:
+            include: target/pipelines/bronze/definitions/**
+
+    layered_shop_gold:                         # the data product
+      name: layered_shop_gold
+      catalog: main
+      schema: layered_shop
+      serverless: true
+      libraries:
+        - glob:
+            include: target/pipelines/gold/definitions/**
