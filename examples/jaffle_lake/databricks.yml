@@ -1,0 +1,24 @@
+# Databricks Asset Bundle deploying the compiled pipeline.
+#
+#   lfd compile                        # regenerate target/definitions/*.sql + spec
+#   databricks bundle deploy           # creates/updates ONE pipeline: "jaffle_lake"
+#   databricks bundle run jaffle_lake  # triggers a pipeline update
+#
+# One spark-pipeline.yml == one pipeline in the Lakeflow UI. Every model in
+# this project is a node/edge of that single DAG.
+bundle:
+  name: jaffle_lake
+
+resources:
+  pipelines:
+    jaffle_lake:
+      name: jaffle_lake
+      catalog: main            # spec `catalog`
+      schema: jaffle_lake      # spec `database`
+      serverless: true
+      libraries:
+        - glob:
+            include: target/definitions/**   # same files spark-pipeline.yml points at
+      # or point DAB at the spec directly on workspace storage:
+      #   configuration:
+      #     pipeline.spec: target/spark-pipeline.yml

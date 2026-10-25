@@ -68,6 +68,9 @@ class ModelConfig:
     ignore_null_updates: Any = None    # bool or column list
     version: Optional[str] = None      # snapshot only: WITH VERSION expression
     once: bool = False                 # AUTO CDC ONCE / one-time backfill
+    # flow-only model: no dataset DDL, just an extra flow INTO another model's
+    # streaming table (SDP supports several flows appending to one target)
+    into: Optional[str] = None
 
     def merged(self, other: Dict[str, Any]) -> "ModelConfig":
         """Return a copy with keys of ``other`` applied (dbt `+` config semantics)."""

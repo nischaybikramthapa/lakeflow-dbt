@@ -78,6 +78,7 @@ models:
 | `on_violation: warn/drop/fail` | plain `EXPECT` / `ON VIOLATION DROP ROW` / `FAIL UPDATE`      |
 | `keys`, `sequence_by`, `stored_as`, `track_history`, `apply_as_deletes/truncates`, `ignore_null_updates`, `columns`, `once` | `AUTO CDC INTO` clauses on the flow |
 | `version` (snapshot)           | `WITH VERSION (expr)` for ordering snapshots                   |
+| `into: other_model`            | flow-only model: no dataset DDL, just an extra `FLOW ... INTO` another model's streaming table (multi-append) |
 | `--select m / +m / m+ / tag:t / resource_type:seed` | dbt-style selection; `compile` also pulls in ancestors so the emitted pipeline is self-contained |
 | `{{ var('x') }}` / `--vars`    | project `vars:` + CLI overrides                                |
 | `macros/`                      | Jinja `{% import %}`/`{% include %}` from `macro-paths`        |
@@ -118,6 +119,20 @@ select * from {{ source('raw', 'customers_feed') }}
 periodic full snapshots and emits `AUTO CDC ... FROM SNAPSHOT (query)`
 (`version` orders the snapshots; `sequence_by` is rejected).
 
+### Multiple flows into one table
+
+SDP lets several flows append to the same streaming table. Set `into:` to
+make a model flow-only — it emits no `CREATE` of its own, just an extra
+`FLOW ... INTO` another model's table:
+
+```sql
+{{ config(materialized='incremental', into='order_events') }}
+select order_id, ... from {{ source('raw', 'orders_eu') }}
+```
+
+`ref()` to a flow-only model resolves to its target table, and refresh
+selectors resolve to the target (the flow-only model has no dataset).
+
 ## Running on Databricks
 
 `lfd run` shells out to the `spark-pipelines` CLI
@@ -137,6 +152,46 @@ lfd run --full-refresh-all
 `+a`, `a+`, `tag:x`, `resource_type:seed`) — the spec is compiled in full so
 every dataset name resolves, and the flags become
 `spark-pipelines run --refresh ds1,ds2`.
+
+## What the pipeline looks like
+
+**One `spark-pipeline.yml` = one pipeline.** Everything a project compiles —
+every MV, streaming table, view, and flow — belongs to a single pipeline
+named after the project (`jaffle_lake` here). In the Databricks UI it
+appears under **Lakeflow → Pipelines** as that one entry; opening it shows
+the DAG: **datasets are nodes, flows are edges**.
+
+For the example project the graph looks like:
+
+```
+raw.orders ──STREAM──> stg_orders ─┬─> order_events ═flow═> order_events (ST)
+raw.orders_eu ──STREAM─────────────┘   order_events_eu ═flow═> order_events (ST)
+stg_customers ─────────────────────────> customers (MV)
+order_events ──────────────────────────> daily_revenue (MV)
+raw.customers_feed ─> customers_scd2__cdc ═AUTO CDC═> customers_scd2 (ST)
+raw.inventory ═AUTO CDC snapshot═> inventory_snapshot (ST)
+seeds/order_status_map.csv ────────────> order_status_map (MV)
+```
+
+(`order_item_totals` is `ephemeral` — inlined as a CTE, no node. Temp staging
+views like `customers_scd2__cdc` show as intermediate nodes feeding their
+flow.)
+
+## Deploying with Databricks Asset Bundles
+
+`lfd` emits exactly what a DAB `pipelines` resource points at. The example
+ships a `databricks.yml`:
+
+```bash
+lfd compile                          # target/definitions/*.sql + spark-pipeline.yml
+databricks bundle deploy             # creates ONE pipeline named `jaffle_lake`
+databricks bundle run jaffle_lake    # triggers a pipeline update
+```
+
+After deploy, the pipeline appears in **Lakeflow → Pipelines** as
+`jaffle_lake` with the full DAG above. Selective refreshes map to update
+triggers on that pipeline (`spark-pipelines run --refresh ...`, or a
+bundle run with the same flags).
 
 Or take `target/` (spec + `definitions/`) into your own bundle/job — point the
 pipeline's libraries at `definitions/**`.

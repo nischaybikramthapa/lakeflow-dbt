@@ -102,7 +102,7 @@ class Compiler:
             if model.is_ephemeral:
                 ctes.add(name)
                 return model.dataset_name
-            out = model.qualified_name
+            out = self._dataset_ref(model)
             if streaming and (
                 model.materialization == "streaming_table" or name in self._stream_views
             ):
@@ -124,6 +124,19 @@ class Compiler:
             return qname
 
         return _SRC_RE.sub(src_sub, _REF_RE.sub(ref_sub, sql))
+
+    def _dataset_ref(self, model: Model) -> str:
+        """Name readers see for a model: its `into` target when flow-only."""
+        if model.config.into:
+            target = self.parsed.models.get(model.config.into)
+            if target is None:
+                for other in self.parsed.models.values():
+                    if other.dataset_name == model.config.into:
+                        target = other
+                        break
+            if target is not None:
+                return target.qualified_name
+        return model.qualified_name
 
     def _ephemeral_ctes(self, seeds: Set[str], *, streaming: bool) -> List[str]:
         """Transitive ephemeral deps, each resolved in the same read context."""
@@ -189,6 +202,14 @@ class Compiler:
 
     def _emit(self, model: Model) -> str:
         mat = model.materialization
+        if model.config.into and mat not in (
+            "streaming_table", "auto_cdc", "auto_cdc_snapshot"
+        ):
+            raise CompilationError(
+                f"{model.name}: `into` requires a flow materialization "
+                f"('incremental', 'auto_cdc', or 'snapshot'), got "
+                f"materialized={model.config.materialized!r}"
+            )
         qname = model.qualified_name
         priv = "PRIVATE " if model.config.private else ""
         spec = ""
@@ -232,16 +253,31 @@ class Compiler:
                 f"AS\n{body};\n"
             )
         if mat == "streaming_table":
+            body = self._body(model, streaming=True)
+            flow = f"CREATE FLOW {model.dataset_name}_flow AS INSERT INTO {qname} BY NAME\n{body};"
+            if model.config.into:
+                # flow-only: append into another model's streaming table
+                target = self._into_target(model)
+                self._warn_dropped_tests(model)
+                flow = (f"CREATE FLOW {model.dataset_name}_flow AS "
+                        f"INSERT INTO {target} BY NAME\n{body};")
+                return header + flow + "\n"
             create = (
                 f"CREATE OR REFRESH {priv}STREAMING TABLE {qname}{spec}{clauses};"
             )
-            body = self._body(model, streaming=True)
-            flow = f"CREATE FLOW {model.dataset_name}_flow AS INSERT INTO {qname} BY NAME\n{body};"
             return header + create + "\n\n" + flow + "\n"
         if mat in ("auto_cdc", "auto_cdc_snapshot"):
             return self._emit_auto_cdc(model, snapshot=(mat == "auto_cdc_snapshot"),
                                        header=header, spec=spec, clauses=clauses)
         raise CompilationError(f"{model.name}: cannot emit materialization {mat!r}")
+
+    def _into_target(self, model: Model) -> str:
+        for other in self.parsed.models.values():
+            if other.name == model.config.into or other.dataset_name == model.config.into:
+                return other.qualified_name
+        raise CompilationError(
+            f"{model.name}: into={model.config.into!r} names no model"
+        )
 
     def _emit_auto_cdc(self, model: Model, *, snapshot: bool,
                        header: str, spec: str, clauses: str) -> str:
@@ -252,8 +288,9 @@ class Compiler:
             raise CompilationError(
                 f"{model.name}: auto_cdc/snapshot requires `keys` (e.g. keys=['id'])"
             )
+        into = self._into_target(model) if cfg.into else qname
         once = "ONCE " if cfg.once else ""
-        flow = [f"CREATE FLOW {model.dataset_name}_flow AS AUTO CDC {once}INTO {qname}"]
+        flow = [f"CREATE FLOW {model.dataset_name}_flow AS AUTO CDC {once}INTO {into}"]
         pre = ""
         if snapshot:
             body = self._body(model, streaming=False)
@@ -309,6 +346,10 @@ class Compiler:
         th = _colspec(cfg.track_history, "TRACK HISTORY ON")
         if th:
             flow.append(th)
+        if cfg.into:
+            # flow-only AUTO CDC: target table is created by another model
+            self._warn_dropped_tests(model)
+            return header + pre + "\n".join(flow) + ";\n"
         create = f"CREATE OR REFRESH {priv}STREAMING TABLE {qname}{spec}{clauses};"
         return header + pre + create + "\n\n" + "\n".join(flow) + ";\n"
 
@@ -327,7 +368,7 @@ class Compiler:
                 continue
             for n in self.graph.select(tok):
                 m = self.parsed.models[n]
-                if not m.is_ephemeral:
+                if not m.is_ephemeral and not m.config.into:
                     names.append(m.qualified_name)
         deduped = list(dict.fromkeys(names))
         if not deduped:

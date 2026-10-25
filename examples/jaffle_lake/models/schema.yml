@@ -10,6 +10,8 @@ sources:
       - name: inventory        # periodic full snapshots -> snapshot materialization
       - name: orders
         streaming: true        # append-only order feed -> STREAM() reads
+      - name: orders_eu        # second append-only feed -> second flow into order_events
+        streaming: true
       - name: payments
         streaming: true
 

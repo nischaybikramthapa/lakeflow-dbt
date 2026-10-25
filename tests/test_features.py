@@ -79,6 +79,47 @@ def test_auto_cdc_requires_keys_and_sequence(tmp_project):
         Compiler(load_project(str(root)), p).compile(target_dir=root / "t1")
 
 
+# --- multi-flow targets (into) -------------------------------------------------
+
+def test_into_emits_flow_only(project, parsed, tmp_path):
+    _, out = compile_example(project, parsed, tmp_path)
+    sql = out["order_events_eu"]
+    assert "CREATE FLOW order_events_eu_flow AS INSERT INTO order_events BY NAME" in sql
+    assert "STREAM(main.raw_data.orders_eu)" in sql
+    # no dataset DDL of its own
+    assert "CREATE OR REFRESH" not in sql and "STREAMING TABLE" not in sql
+    # the target's CREATE still exists
+    assert "CREATE OR REFRESH STREAMING TABLE order_events" in out["order_events"]
+
+
+def test_into_model_not_a_dataset(project, parsed):
+    c = Compiler(project, parsed)
+    datasets = c.resolve_datasets("+order_events_eu")  # parents incl. the target
+    assert "order_events_eu" not in datasets   # flow-only -> no dataset
+    assert "order_events" in datasets          # the target table is refreshable
+
+
+def test_into_requires_flow_materialization(tmp_project):
+    root = tmp_project({
+        "lakeflow_project.yml": "name: t\n",
+        "models/a.sql": "{{ config(materialized='incremental') }}\nselect 1 as id\n",
+        "models/b.sql": "{{ config(materialized='table', into='a') }}\nselect 1 as id\n",
+    })
+    p = parse_project(load_project(str(root)))
+    with pytest.raises(CompilationError, match="into.*flow materialization"):
+        Compiler(load_project(str(root)), p).compile(target_dir=root / "t1")
+
+
+def test_into_unknown_target_rejected(tmp_project):
+    from lakeflow_dbt.errors import ParseError
+    root = tmp_project({
+        "lakeflow_project.yml": "name: t\n",
+        "models/b.sql": "{{ config(materialized='incremental', into='ghost') }}\nselect 1\n",
+    })
+    with pytest.raises(ParseError, match="ghost"):
+        parse_project(load_project(str(root)))
+
+
 # --- selective refresh ---------------------------------------------------------
 
 def test_resolve_datasets(project, parsed):

@@ -248,6 +248,24 @@ def parse_project(project: Project) -> ParseResult:
             except ValueError as e:
                 raise ParseError(f"schema.yml config for {mname!r}: {e}") from e
 
+    # flow-only models: `into` must name another model; add it as a dependency
+    # edge so compile closure always emits the target's CREATE
+    by_dataset = {m.dataset_name: m.name for m in result.models.values()}
+    for m in result.models.values():
+        if not m.config.into:
+            continue
+        target = m.config.into
+        if target == m.name or target == m.dataset_name:
+            raise ParseError(f"{m.name}: `into` cannot target itself")
+        if target not in result.models and target not in by_dataset:
+            raise ParseError(
+                f"{m.name}: into={target!r} names no model — a flow's target "
+                f"must be a dataset declared in this project"
+            )
+        target_model = result.models.get(target) or result.models[by_dataset[target]]
+        if target_model.name not in m.refs:
+            m.refs.append(target_model.name)
+
     return result
 
 
