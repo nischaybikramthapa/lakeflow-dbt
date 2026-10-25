@@ -10,7 +10,7 @@ def test_parse_command(capsys):
     rc = main(["--project-dir", str(EXAMPLE), "parse"])
     assert rc == 0
     out = capsys.readouterr().out
-    assert "10 model(s)" in out
+    assert "11 model(s)" in out
     assert "6 source table(s)" in out
 
 

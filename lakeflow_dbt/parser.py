@@ -126,6 +126,121 @@ def _render_model(project: Project, path: Path, model_root: Path) -> Model:
 
 
 # --------------------------------------------------------------------------
+# Python models — dbt-style `def model(dbt, spark)` files compiled to
+# pyspark.pipelines (dp) definitions.
+# --------------------------------------------------------------------------
+
+_PY_REF_RE = re.compile(r"dbt\.ref\(\s*['\"]([A-Za-z_][\w]*)['\"]\s*\)")
+_PY_SRC_RE = re.compile(
+    r"dbt\.source\(\s*['\"]([A-Za-z_][\w]*)['\"]\s*,\s*['\"]([A-Za-z_][\w]*)['\"]\s*\)"
+)
+
+
+def _py_literal(node, where: str):
+    import ast
+
+    try:
+        return ast.literal_eval(node)
+    except (ValueError, SyntaxError):
+        raise ParseError(f"{where}: config values must be literals")
+
+
+def _render_py_model(project: Project, path: Path, model_root: Path) -> Model:
+    """Parse a python model: `def model(dbt, spark)` whose body builds a
+    DataFrame. `dbt.config(**kw)` sets config; `dbt.ref('x')` /
+    `dbt.source('s','t')` mark dependencies and are rewritten to name strings.
+    """
+    import ast
+
+    name = path.stem
+    if not NAME_RE.match(name):
+        raise ParseError(f"{path}: model name {name!r} must match {NAME_RE.pattern}")
+    raw = path.read_text()
+    try:
+        tree = ast.parse(raw)
+    except SyntaxError as e:
+        raise ParseError(f"{path}: invalid python: {e}") from e
+
+    fn = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, ast.FunctionDef) and n.name == "model"),
+        None,
+    )
+    if fn is None:
+        raise ParseError(
+            f"{path}: python models must define `def model(dbt, spark)`"
+        )
+
+    config_kwargs: Dict[str, Any] = {}
+    refs: List[str] = []
+    sources: List[str] = []
+    config_lines = set()
+    lines = raw.splitlines()
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        attr = getattr(func, "attr", None)
+        base = getattr(getattr(func, "value", None), "id", None)
+        if base != "dbt" or attr not in ("config", "ref", "source"):
+            continue
+        if attr == "config":
+            config_lines.update(range(node.lineno, (node.end_lineno or node.lineno) + 1))
+            for kw in node.keywords:
+                config_kwargs[kw.arg] = _py_literal(kw.value, f"{path}")
+        elif attr == "ref":
+            if len(node.args) != 1 or not isinstance(node.args[0], ast.Constant):
+                raise ParseError(f"{path}: dbt.ref() takes one string arg")
+            rname = node.args[0].value
+            if rname not in refs:
+                refs.append(rname)
+        else:  # source
+            if len(node.args) != 2 or not all(
+                isinstance(a, ast.Constant) for a in node.args
+            ):
+                raise ParseError(f"{path}: dbt.source() takes two string args")
+            key = f"{node.args[0].value}.{node.args[1].value}"
+            if key not in sources:
+                sources.append(key)
+
+    # body = function body minus signature and dbt.config(...) statements,
+    # with dbt.ref/dbt.source replaced by plain name strings
+    body_lines = lines[fn.body[0].lineno - 1:(fn.body[-1].end_lineno or fn.body[-1].lineno)]
+    body = "\n".join(
+        ln for i, ln in enumerate(body_lines, start=fn.body[0].lineno)
+        if i not in config_lines
+    )
+    import textwrap
+    body = _PY_SRC_RE.sub(lambda m: repr(f"{m.group(1)}.{m.group(2)}"), body)
+    body = _PY_REF_RE.sub(lambda m: repr(m.group(1)), body)
+    body = textwrap.dedent(body)
+
+    fqn_dir = ""
+    try:
+        fqn_dir = path.parent.relative_to(model_root).as_posix()
+    except ValueError:
+        pass
+    try:
+        config = model_config_for(project, fqn_dir, config_kwargs)
+    except ConfigError as e:
+        raise ParseError(f"{path}: {e}") from e
+
+    return Model(
+        name=name,
+        rel_path=path.relative_to(project.root),
+        abs_path=path,
+        raw_sql=raw,
+        rendered_sql=body,
+        refs=refs,
+        sources=sources,
+        config=config,
+        fqn_dir=fqn_dir,
+        language="python",
+    )
+
+
+# --------------------------------------------------------------------------
 # schema.yml
 # --------------------------------------------------------------------------
 
@@ -187,8 +302,13 @@ def _parse_schema_file(path: Path, result: ParseResult) -> None:
             if not cname:
                 raise ParseError(f"{path}: a column of model {mname} is missing `name`")
             where = f"{path}: model {mname}, column {cname}"
-            meta.tests.extend(_parse_tests(col.get("tests") or col.get("data_tests"),
-                                           cname, where))
+            col_tests = _parse_tests(col.get("tests") or col.get("data_tests"),
+                                     cname, where)
+            meta.tests.extend(col_tests)
+            meta.columns[cname] = {
+                "description": col.get("description"),
+                "tests": [t.test_name for t in col_tests],
+            }
         where = f"{path}: model {mname}"
         meta.tests.extend(_parse_tests(m.get("tests") or m.get("data_tests"), None, where))
 
@@ -208,6 +328,14 @@ def parse_project(project: Project) -> ParseResult:
             continue
         for path in sorted(mroot.rglob("*.sql")):
             model = _render_model(project, path, mroot)
+            if model.name in result.models:
+                raise ParseError(
+                    f"duplicate model name {model.name!r}: {path} and "
+                    f"{result.models[model.name].abs_path}"
+                )
+            result.models[model.name] = model
+        for path in sorted(mroot.rglob("*.py")):
+            model = _render_py_model(project, path, mroot)
             if model.name in result.models:
                 raise ParseError(
                     f"duplicate model name {model.name!r}: {path} and "
@@ -242,6 +370,7 @@ def parse_project(project: Project) -> ParseResult:
             continue
         model.description = meta.description
         model.tests = list(meta.tests)
+        model.columns = dict(meta.columns)
         if meta.config:
             try:
                 model.config = model.config.merged(meta.config)
@@ -257,14 +386,16 @@ def parse_project(project: Project) -> ParseResult:
         target = m.config.into
         if target == m.name or target == m.dataset_name:
             raise ParseError(f"{m.name}: `into` cannot target itself")
-        if target not in result.models and target not in by_dataset:
+        if target in result.models or target in by_dataset:
+            target_model = result.models.get(target) or result.models[by_dataset[target]]
+            if target_model.name not in m.refs:
+                m.refs.append(target_model.name)
+        elif "." not in target:
             raise ParseError(
-                f"{m.name}: into={target!r} names no model — a flow's target "
-                f"must be a dataset declared in this project"
+                f"{m.name}: into={target!r} names no model — pass a model name "
+                f"or a qualified external target like 'catalog.schema.table'"
             )
-        target_model = result.models.get(target) or result.models[by_dataset[target]]
-        if target_model.name not in m.refs:
-            m.refs.append(target_model.name)
+        # qualified into= -> external sink table outside this project
 
     return result
 

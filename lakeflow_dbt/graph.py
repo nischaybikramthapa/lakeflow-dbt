@@ -1,7 +1,7 @@
 """Dependency graph over models, plus dbt-style node selection."""
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Set
+from typing import Dict, Iterable, List, Optional, Set
 
 from .errors import GraphError
 from .model import Model
@@ -10,8 +10,11 @@ from .model import Model
 class Graph:
     """Models only: sources are leaf reads handled by the pipeline engine."""
 
-    def __init__(self, models: Dict[str, Model]):
+    def __init__(self, models: Dict[str, Model],
+                 state: Optional[Dict[str, str]] = None):
         self.models = {n: m for n, m in models.items() if m.config.enabled}
+        # name -> checksum from a previous manifest, for state: selectors
+        self._state = state or {}
         self.parents: Dict[str, Set[str]] = {}
         self.children: Dict[str, Set[str]] = {n: set() for n in self.models}
         for name, model in self.models.items():
@@ -77,57 +80,116 @@ class Graph:
         return out
 
     def select(self, selector: str) -> List[str]:
-        """dbt-flavored selection: `name`, `+name`, `name+`, `+name+`, `tag:t`, `tag:t+`."""
+        """dbt-flavored selection.
+
+        Whitespace separates unions; commas inside a token intersect, e.g.
+        `tag:gold,marts` = marts models also tagged gold. `+` edges work per
+        sub-token. Kinds: `name`, `dir`, `path:p`, `fqn:a.b`, `tag:t`,
+        `source:s.t`, `resource_type:rt`, `config:k[:v]`, `state:x`.
+        """
         if not selector:
             return self.topo_order()
         chosen: Set[str] = set()
         for tok in selector.split():
-            parents = tok.startswith("+")
-            children = tok.endswith("+")
-            core = tok.strip("+")
-            if core.startswith("tag:"):
-                tag = core[4:]
-                seeds = [n for n, m in self.models.items() if tag in (m.config.tags or [])]
-                if not seeds:
-                    raise GraphError(f"no models with tag {tag!r}")
-            elif core.startswith("resource_type:") or core.startswith("type:"):
-                rt = core.split(":", 1)[1]
-                seeds = [n for n, m in self.models.items() if m.resource_type == rt]
-                if not seeds:
-                    raise GraphError(f"no nodes with resource_type {rt!r}")
-            elif core.startswith("source:"):
-                key = core[7:]
-                seeds = [n for n, m in self.models.items() if key in m.sources]
-                if not seeds:
-                    raise GraphError(f"no models read source {key!r}")
-            elif core.startswith("path:"):
-                pref = core[5:].strip("/")
-                seeds = [
-                    n for n, m in self.models.items()
-                    if m.fqn_dir == pref or m.fqn_dir.startswith(pref + "/")
-                    or str(m.rel_path).startswith(pref + "/")
-                    or f"/{pref}/" in str(m.rel_path)
-                ]
-                if not seeds:
-                    raise GraphError(f"no models under path {pref!r}")
-            else:
-                if core in self.models:
-                    seeds = [core]
-                else:
-                    # bare directory name: dbt fqn semantics — `staging` selects
-                    # everything under models/staging/
-                    seeds = [
-                        n for n, m in self.models.items()
-                        if m.fqn_dir == core or m.fqn_dir.startswith(core + "/")
-                        or f"/{core}" in m.fqn_dir
-                    ]
-                    if not seeds:
-                        raise GraphError(f"selector {core!r} matches no model")
-            for s in seeds:
-                chosen.add(s)
-                if parents:
-                    chosen |= self.ancestors(s)
-                if children:
-                    chosen |= self.descendants(s)
+            group: Optional[Set[str]] = None
+            for sub in tok.split(","):
+                seeds = self._seeds(sub)
+                group = seeds if group is None else (group & seeds)
+            chosen |= group or set()
         # strict dbt semantics: only the selected nodes, in dependency order
         return [n for n in self.topo_order() if n in chosen]
+
+    def _seeds(self, tok: str) -> Set[str]:
+        """One selection atom -> matched node set (with +/- expansion)."""
+        parents = tok.startswith("+")
+        children = tok.endswith("+")
+        core = tok.strip("+")
+        if core.startswith("tag:"):
+            tag = core[4:]
+            seeds = [n for n, m in self.models.items() if tag in (m.config.tags or [])]
+            if not seeds:
+                raise GraphError(f"no models with tag {tag!r}")
+        elif core.startswith("resource_type:") or core.startswith("type:"):
+            rt = core.split(":", 1)[1]
+            seeds = [n for n, m in self.models.items() if m.resource_type == rt]
+            if not seeds:
+                raise GraphError(f"no nodes with resource_type {rt!r}")
+        elif core.startswith("source:"):
+            key = core[7:]
+            seeds = [n for n, m in self.models.items() if key in m.sources]
+            if not seeds:
+                raise GraphError(f"no models read source {key!r}")
+        elif core.startswith("path:"):
+            pref = core[5:].strip("/")
+            seeds = [
+                n for n, m in self.models.items()
+                if m.fqn_dir == pref or m.fqn_dir.startswith(pref + "/")
+                or str(m.rel_path).startswith(pref + "/")
+                or f"/{pref}/" in str(m.rel_path)
+            ]
+            if not seeds:
+                raise GraphError(f"no models under path {pref!r}")
+        elif core.startswith("fqn:"):
+            pref = core[4:].strip(".")
+            seeds = [n for n, m in self.models.items()
+                     if self._fqn(m) == pref or self._fqn(m).startswith(pref + ".")]
+            if not seeds:
+                raise GraphError(f"no models under fqn {pref!r}")
+        elif core.startswith("config:"):
+            spec = core[7:]
+            key, _, val = spec.partition(":")
+            seeds = [
+                n for n, m in self.models.items()
+                if hasattr(m.config, key) and (
+                    not val or str(getattr(m.config, key)) == val
+                ) and (not val or getattr(m.config, key) is not None)
+            ]
+            if not seeds:
+                raise GraphError(f"no models with config {spec!r}")
+        elif core.startswith("state:"):
+            kind = core[6:]
+            if not self._state:
+                raise GraphError(
+                    f"state: selector needs a manifest — pass --state <dir> "
+                    f"(or compile once so target/manifest.json exists)"
+                )
+            seeds = [n for n in self.models if self._state_match(n, kind)]
+            if not seeds:
+                raise GraphError(f"no models matched state:{kind}")
+        else:
+            if core in self.models:
+                seeds = [core]
+            else:
+                # bare directory name: dbt fqn semantics — `staging` selects
+                # everything under models/staging/
+                seeds = [
+                    n for n, m in self.models.items()
+                    if m.fqn_dir == core or m.fqn_dir.startswith(core + "/")
+                    or f"/{core}" in m.fqn_dir
+                ]
+                if not seeds:
+                    raise GraphError(f"selector {core!r} matches no model")
+        out = set(seeds)
+        for s in seeds:
+            if parents:
+                out |= self.ancestors(s)
+            if children:
+                out |= self.descendants(s)
+        return out
+
+    @staticmethod
+    def _fqn(m: Model) -> str:
+        return ((m.fqn_dir or "") + "." + m.name).strip(".").replace("/", ".")
+
+    def _state_match(self, name: str, kind: str) -> bool:
+        cur = self.models[name].checksum
+        old = self._state.get(name)
+        if kind == "new":
+            return old is None
+        if kind == "modified":
+            return old != cur
+        if kind == "unmodified":
+            return old == cur
+        raise GraphError(
+            f"unknown state:{kind}; expected new|modified|unmodified"
+        )

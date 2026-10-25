@@ -120,6 +120,53 @@ def test_into_unknown_target_rejected(tmp_project):
         parse_project(load_project(str(root)))
 
 
+# --- python models ---------------------------------------------------------------
+
+def test_python_model_compiles(project, parsed, tmp_path):
+    _, out = compile_example(project, parsed, tmp_path)
+    py = out["customer_rank"]
+    assert "from pyspark import pipelines as dp" in py
+    assert "@dp.materialized_view(name='customer_rank'" in py
+    assert "spark.read.table('customers')" in py
+    assert "spark.read.table('order_events')" in py
+    assert "dbt.config" not in py and "dbt.ref" not in py
+
+
+def test_state_selectors(project, parsed, tmp_path):
+    import json
+    compile_example(project, parsed, tmp_path)
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    state = {n: d["checksum"] for n, d in manifest["nodes"].items()}
+    c = Compiler(project, parsed, state=state)
+    with pytest.raises(Exception, match="no models matched state:modified"):
+        c.graph.select("state:modified")
+    assert set(c.graph.select("state:unmodified")) == set(parsed.models)
+    with pytest.raises(Exception, match="no models matched state:new"):
+        c.graph.select("state:new")
+
+
+def test_new_selectors(project, parsed):
+    g = Compiler(project, parsed).graph
+    assert set(g.select("fqn:marts.customers")) == {"customers"}
+    assert set(g.select("config:materialized:incremental")) >= {"order_events"}
+    assert set(g.select("config:flow:auto_cdc")) >= {"customers_scd2"}
+    # comma = intersection: marts models that are also incremental-ish
+    assert set(g.select("marts,config:materialized:incremental")) == {
+        "order_events", "order_events_eu", "customers_scd2", "inventory_snapshot",
+    }
+
+
+def test_external_into(tmp_project):
+    root = tmp_project({
+        "lakeflow_project.yml": "name: t\n",
+        "models/sink.sql": "{{ config(materialized='incremental', into='main.out.events') }}\nselect 1 as id\n",
+    })
+    p = parse_project(load_project(str(root)))
+    res = Compiler(load_project(str(root)), p).compile(target_dir=root / "t")
+    sql = {f.stem: f.read_text() for f in res.files}["sink"]
+    assert "INSERT INTO main.out.events" in sql
+
+
 # --- multi-pipeline projects ---------------------------------------------------
 
 from pathlib import Path as _Path

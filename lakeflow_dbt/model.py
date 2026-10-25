@@ -146,6 +146,8 @@ class ModelMeta:
     description: Optional[str] = None
     tests: List[ColumnTest] = field(default_factory=list)
     config: Dict[str, Any] = field(default_factory=dict)
+    # declared columns from schema.yml: name -> {description, tests}
+    columns: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -166,20 +168,22 @@ class SourceTable:
 
 @dataclass
 class Model:
-    """A single .sql model file, parsed and ready to compile."""
+    """A single model file, parsed and ready to compile."""
 
     name: str
     rel_path: Path          # relative to project root
     abs_path: Path
     raw_sql: str
-    rendered_sql: str       # jinja-rendered, refs/sources as markers
+    rendered_sql: str       # jinja-rendered (sql) or rewritten body (python)
     refs: List[str]
     sources: List[str]      # "source.table" keys
     config: ModelConfig
     fqn_dir: str = ""       # dir name under model-path root, for +materialized trees
     description: Optional[str] = None
     tests: List[ColumnTest] = field(default_factory=list)
+    columns: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     resource_type: str = "model"   # 'model' | 'seed'
+    language: str = "sql"          # 'sql' | 'python'
 
     @property
     def dataset_name(self) -> str:
@@ -196,6 +200,18 @@ class Model:
     @property
     def is_ephemeral(self) -> bool:
         return self.materialization == "cte"
+
+    @property
+    def checksum(self) -> str:
+        """Fingerprint for state: selection — source + resolved config + dir."""
+        import hashlib
+        import json
+        h = hashlib.sha1()
+        h.update(self.raw_sql.encode())
+        h.update(json.dumps(self.config.__dict__, sort_keys=True,
+                            default=str).encode())
+        h.update(self.fqn_dir.encode())
+        return h.hexdigest()
 
 
 @dataclass
@@ -215,10 +231,10 @@ class Project:
     seed_paths: List[str] = field(default_factory=list)
     # raw `seeds:` tree for +config resolution
     seed_tree: Dict[str, Any] = field(default_factory=dict)
-    # `pipelines:` map — pipeline name -> model selector. Empty = one pipeline
-    # containing the whole project (each entry compiles to its own spec +
-    # deploys as a separate pipeline in the Lakeflow UI)
-    pipelines: Dict[str, str] = field(default_factory=dict)
+    # `pipelines:` map — pipeline name -> {select, catalog?, schema?,
+    # storage?, configuration?}. Empty = one pipeline containing the whole
+    # project (each entry compiles to its own spec + deploys separately)
+    pipelines: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     def base_config(self) -> ModelConfig:
         return ModelConfig()

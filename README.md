@@ -232,6 +232,26 @@ pipeline's libraries at `definitions/**`.
   Refreshes are the selective operation: `--refresh`/`--full-refresh` pick the
   datasets to update inside a fully compiled spec.
 
+## More
+
+- **`lfd test`** emits set-level checks (`unique`, `relationships`) as
+  violation queries to `target/tests/` — they can't be row expectations.
+- **`lfd docs generate`/`serve`** builds a static lineage site from the
+  manifest(s): pipeline grouping, edges, columns, descriptions.
+- **`lfd deploy`** writes `databricks.yml` from `pipelines:` — one
+  `resources.pipelines` entry per spec, with per-pipeline
+  `catalog`/`schema`/`storage`/`configuration` overrides.
+- **Python models** — `models/*.py` with `def model(dbt, spark)` compile to
+  `pyspark.pipelines` definitions (`@dp.materialized_view`,
+  `create_auto_cdc_flow`, `@dp.expect*`).
+- **Selectors**: `name`, `+name`, `name+`, `tag:`, `path:`, `fqn:`,
+  `source:`, `resource_type:`, `config:k[:v]`, `state:new|modified|unmodified`
+  (`--state` for a prod manifest), comma = intersection.
+- **External sinks**: `into='catalog.schema.table'` appends a flow to a
+  table outside the project.
+
+See **[GUIDE.md](GUIDE.md)** for the end-to-end walkthrough.
+
 ## Tests
 
 ```bash

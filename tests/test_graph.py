@@ -20,7 +20,8 @@ def test_select_plus_and_minus(parsed):
         "customers", "stg_customers", "stg_orders",
     }
     assert set(g.select("stg_orders+")) == {
-        "stg_orders", "customers", "order_events", "order_events_eu", "daily_revenue",
+        "stg_orders", "customers", "order_events", "order_events_eu",
+            "customer_rank", "daily_revenue",
     }
     assert g.select("customers") == ["customers"]
 

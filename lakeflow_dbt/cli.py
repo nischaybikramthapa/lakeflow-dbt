@@ -84,6 +84,28 @@ def _load(args):
     return project, parsed
 
 
+def _state_map(project, args) -> dict:
+    """name -> checksum from a previous manifest, for `state:` selectors.
+
+    Reads --state <dir> or the project target dir (all manifests found).
+    """
+    from .docs import load_manifests
+    state_dir = Path(getattr(args, "state", "") or
+                     (project.root / project.target_path))
+    if not state_dir.is_dir():
+        return {}
+    out = {}
+    for m in load_manifests(state_dir).values():
+        for name, n in (m.get("nodes") or {}).items():
+            if n.get("checksum"):
+                out[name] = n["checksum"]
+    return out
+
+
+def _compiler(project, parsed, args) -> Compiler:
+    return Compiler(project, parsed, state=_state_map(project, args))
+
+
 def _print_warnings(warnings, out=sys.stderr):
     for w in warnings:
         print(f"  warning: {w}", file=out)
@@ -115,7 +137,7 @@ def cmd_parse(args) -> int:
 
 def cmd_compile(args) -> int:
     project, parsed = _load(args)
-    results = Compiler(project, parsed).compile_pipelines(
+    results = _compiler(project, parsed, args).compile_pipelines(
         select=args.select, pipeline=args.pipeline)
     for pname, result in results.items():
         _print_warnings(result.warnings)
@@ -129,7 +151,7 @@ def cmd_compile(args) -> int:
 
 def cmd_ls(args) -> int:
     project, parsed = _load(args)
-    compiler = Compiler(project, parsed)
+    compiler = _compiler(project, parsed, args)
     assigned: dict = {}
     if project.pipelines:
         for pname, sel in compiler.pipeline_assignments().items():
@@ -183,7 +205,7 @@ def _refresh_cmd(args, compiler: Compiler, within=None) -> list:
 
 def cmd_run(args) -> int:
     project, parsed = _load(args)
-    compiler = Compiler(project, parsed)
+    compiler = _compiler(project, parsed, args)
     # `lfd refresh --select x` == `lfd run --refresh x`
     if getattr(args, "refresh_selector", False) and not (args.refresh or args.full_refresh):
         args.refresh = args.select
@@ -242,6 +264,7 @@ def build_parser() -> argparse.ArgumentParser:
         s.add_argument("--pipeline", action="append",
                        help="only this `pipelines:` entry (repeatable)")
         s.add_argument("--vars", help="inline JSON/YAML map of vars for {{ var() }}")
+        s.add_argument("--state", help="dir containing a previous manifest for state: selectors")
         s.set_defaults(fn={"compile": cmd_compile, "run": cmd_run,
                            "refresh": cmd_run, "ls": cmd_ls}[name])
         if name == "refresh":
@@ -259,7 +282,96 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("seed", help="compile seed CSVs under seed-paths")
     s.add_argument("--vars", help="inline JSON/YAML map")
     s.set_defaults(fn=cmd_seed)
+
+    s = sub.add_parser("test", help="emit set-level data-quality check queries")
+    s.add_argument("--select")
+    s.add_argument("--vars")
+    s.set_defaults(fn=cmd_test)
+
+    s = sub.add_parser("docs", help="generate/serve the lineage site")
+    ds = s.add_subparsers(dest="docs_command", required=True)
+    d = ds.add_parser("generate", help="write target/docs/index.html")
+    d.add_argument("--vars")
+    d.set_defaults(fn=cmd_docs)
+    d = ds.add_parser("serve", help="generate and serve the site locally")
+    d.add_argument("--vars")
+    d.add_argument("--port", type=int, default=8080)
+    d.set_defaults(fn=cmd_docs)
+
+    s = sub.add_parser("deploy", help="write a DAB databricks.yml from pipelines:")
+    s.add_argument("--vars")
+    s.add_argument("--print", action="store_true", help="print instead of writing")
+    s.add_argument("--out", help="output file (default <project>/databricks.yml)")
+    s.set_defaults(fn=cmd_deploy)
     return p
+
+
+def cmd_test(args) -> int:
+    """dbt `test` analogue: emit check SQL for set-level tests."""
+    project, parsed = _load(args)
+    from .testgen import generate
+    target = project.root / project.target_path
+    files = generate(project, parsed, args.select, target)
+    if not files:
+        print("no checkable tests declared")
+        return 0
+    print(f"Wrote {len(files)} check file(s) -> {target / 'tests'}")
+    for f in files:
+        print(f"  {f.relative_to(target)}")
+    print("Run them against the deployed datasets, e.g.:")
+    print("  spark-sql -f target/tests/<model>.sql")
+    return 0
+
+
+def cmd_docs(args) -> int:
+    project, _ = _load(args)
+    from .docs import generate
+    target = project.root / project.target_path
+    try:
+        f = generate(target, target / "docs")
+    except FileNotFoundError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    print(f"wrote {f}")
+    if args.docs_command == "serve":
+        import http.server
+        import functools
+        handler = functools.partial(http.server.SimpleHTTPRequestHandler,
+                                    directory=str(target / "docs"))
+        print(f"serving on http://localhost:{args.port} (Ctrl-C to stop)")
+        http.server.ThreadingHTTPServer(("127.0.0.1", args.port), handler).serve_forever()
+    return 0
+
+
+def cmd_deploy(args) -> int:
+    """Generate a Databricks Asset Bundle from `pipelines:`."""
+    project, parsed = _load(args)
+    import yaml
+    pipes = project.pipelines or {project.name: {"select": ""}}
+    resources = {"pipelines": {}}
+    for pname, spec in pipes.items():
+        res_name = f"{project.name}_{pname}" if project.pipelines else pname
+        root = "target/pipelines" if project.pipelines else "target"
+        entry = {
+            "name": res_name,
+            "catalog": spec.get("catalog") or project.catalog,
+            "schema": spec.get("schema") or spec.get("database") or project.schema,
+            "serverless": True,
+            "libraries": [{"glob": {"include": f"{root}/{pname}/definitions/**"
+                                        if project.pipelines else
+                                        "target/definitions/**"}}],
+        }
+        resources["pipelines"][res_name] = {k: v for k, v in entry.items()
+                                            if v is not None}
+    bundle = {"bundle": {"name": project.name}, "resources": resources}
+    text = yaml.safe_dump(bundle, sort_keys=False)
+    if args.print:
+        print(text)
+        return 0
+    out = Path(args.out) if args.out else project.root / "databricks.yml"
+    out.write_text(text)
+    print(f"wrote {out} — deploy with `databricks bundle deploy`")
+    return 0
 
 
 def main(argv=None) -> int:

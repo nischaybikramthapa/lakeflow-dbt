@@ -60,19 +60,26 @@ def load_project(start: Optional[str] = None, vars_override: Optional[Dict[str, 
     )
 
 
-def _pipelines_map(raw) -> Dict[str, str]:
-    """`pipelines:` -> {name: selector}. Values may be a selector string or a
-    mapping with a `select` key (room for per-pipeline options later)."""
+def _pipelines_map(raw) -> Dict[str, Dict[str, Any]]:
+    """`pipelines:` -> {name: {select, catalog?, schema?, storage?,
+    configuration?}}. Values may be a bare selector string or a mapping."""
     if not raw:
         return {}
     if not isinstance(raw, dict):
         raise ConfigError("`pipelines:` must be a mapping of name -> selector")
-    out = {}
+    out: Dict[str, Dict[str, Any]] = {}
     for pname, val in raw.items():
         if isinstance(val, str):
-            out[pname] = val
+            out[pname] = {"select": val}
         elif isinstance(val, dict) and isinstance(val.get("select"), str):
-            out[pname] = val["select"]
+            extra = {k: v for k, v in val.items() if k != "select"}
+            bad = set(extra) - {"catalog", "schema", "database", "storage",
+                                "configuration"}
+            if bad:
+                raise ConfigError(
+                    f"pipelines.{pname}: unknown keys: {', '.join(sorted(bad))}"
+                )
+            out[pname] = {"select": val["select"], **extra}
         else:
             raise ConfigError(
                 f"pipelines.{pname}: expected a selector string or {{select: ...}}"

@@ -80,10 +80,11 @@ def _colspec(value, keyword: str) -> str:
 
 
 class Compiler:
-    def __init__(self, project: Project, parsed: ParseResult):
+    def __init__(self, project: Project, parsed: ParseResult,
+                 state: Optional[Dict[str, str]] = None):
         self.project = project
         self.parsed = parsed
-        self.graph = Graph(parsed.models)
+        self.graph = Graph(parsed.models, state=state)
         self.warnings: List[str] = list(parsed.warnings)
         # view-type models upstream of a streaming table: published views can't
         # be streaming sources, so they compile to TEMPORARY VIEW + STREAM() reads
@@ -213,6 +214,12 @@ class Compiler:
 
     def _emit(self, model: Model) -> str:
         mat = model.materialization
+        if model.language == "python":
+            if mat == "cte":
+                raise CompilationError(
+                    f"{model.name}: python models can't be materialized='ephemeral'"
+                )
+            return self._emit_python(model)
         if model.config.into and mat != "streaming_table":
             raise CompilationError(
                 f"{model.name}: `into` requires a streaming table "
@@ -282,12 +289,129 @@ class Compiler:
         raise CompilationError(f"{model.name}: cannot emit materialization {mat!r}")
 
     def _into_target(self, model: Model) -> str:
+        into = model.config.into or ""
+        if "." in into:
+            return into   # qualified external target (sink table)
         for other in self.parsed.models.values():
-            if other.name == model.config.into or other.dataset_name == model.config.into:
+            if other.name == into or other.dataset_name == into:
                 return other.qualified_name
+        raise CompilationError(f"{model.name}: into={into!r} names no model")
+
+    # -- python emission ------------------------------------------------------
+
+    def _py_expectations(self, model: Model) -> List[str]:
+        """Row-level tests -> @dp.expect* decorators (expectations only)."""
+        from .tests_map import ROW_LEVEL_TESTS, UNEXPRESSIBLE_TESTS
+        deco = {"warn": "expect", "drop": "expect_or_drop",
+                "fail": "expect_or_fail"}
+        out: List[str] = []
+        for t in model.tests:
+            if t.test_name in UNEXPRESSIBLE_TESTS:
+                self.warnings.append(
+                    f"{model.name}: test {t.test_name!r} can't be a pipeline "
+                    f"expectation; skipped"
+                )
+                continue
+            fn = ROW_LEVEL_TESTS.get(t.test_name)
+            if fn is None or (t.column is None and t.test_name != "expression_is_true"):
+                self.warnings.append(f"{model.name}: test {t.test_name!r} skipped")
+                continue
+            try:
+                expr = fn(t)
+            except ValueError as e:
+                self.warnings.append(f"{model.name}: {e}")
+                continue
+            dec = deco.get(t.severity or model.config.on_violation, "expect")
+            tname = f"{t.test_name}_{t.column}" if t.column else t.test_name
+            out.append(f'@dp.{dec}({tname!r}, {expr!r})')
+        return out
+
+    def _emit_python(self, model: Model) -> str:
+        mat = model.materialization
+        cfg = model.config
+        qname = model.qualified_name
+        body = _indent(model.rendered_sql, "    ")
+        header = f"# {model.rel_path}\nfrom pyspark import pipelines as dp\n"
+        comment = f', comment={model.description!r}' if model.description else ""
+        decos = "\n".join(self._py_expectations(model))
+        decos = (decos + "\n") if decos else ""
+
+        if mat == "materialized_view":
+            return (f"{header}\n@dp.materialized_view(name={model.dataset_name!r}{comment})\n"
+                    f"{decos}def {model.dataset_name}(spark):\n{body}\n")
+        if mat in ("view", "temporary_view"):
+            if mat == "view":
+                self.warnings.append(
+                    f"{model.name}: python views emit as dp.temporary_view "
+                    f"(the python API has no published-view decorator)"
+                )
+            self._warn_dropped_tests(model)
+            return (f"{header}\n@dp.temporary_view\n"
+                    f"def {model.dataset_name}(spark):\n{body}\n")
+        if mat == "streaming_table":
+            if cfg.flow == "auto_cdc":
+                return self._emit_python_auto_cdc(model, header, body)
+            flow = (f"@dp.append_flow(target={model.dataset_name!r})\n"
+                    f"def {model.dataset_name}_flow(spark):\n{body}\n")
+            if cfg.into:
+                target = self._into_target(model)
+                self._warn_dropped_tests(model)
+                return (f"{header}\n@dp.append_flow(target={target!r})\n"
+                        f"def {model.dataset_name}_flow(spark):\n{body}\n")
+            return (f"{header}\ndp.create_streaming_table("
+                    f"name={model.dataset_name!r}{comment})\n"
+                    f"{decos}\n{flow}")
         raise CompilationError(
-            f"{model.name}: into={model.config.into!r} names no model"
+            f"{model.name}: python models support materialized="
+            f"'table'|'incremental'|'view'|'temp_view', got "
+            f"{model.config.materialized!r}"
         )
+
+    def _emit_python_auto_cdc(self, model: Model, header: str, body: str) -> str:
+        cfg = model.config
+        if not cfg.keys:
+            raise CompilationError(
+                f"{model.name}: flow='auto_cdc' requires `keys`"
+            )
+        target = self._into_target(model) if cfg.into else model.qualified_name
+        src_fn = f"{model.dataset_name}__cdc"
+        sa = STORED_AS.get(str(cfg.stored_as).lower()) if cfg.stored_as else None
+        if cfg.snapshot:
+            if cfg.sequence_by:
+                raise CompilationError(
+                    f"{model.name}: `sequence_by` is not valid for snapshot"
+                )
+            kwargs = {"target": target, "source": src_fn, "keys": cfg.keys}
+            if cfg.version:
+                kwargs["version"] = cfg.version
+            if sa:
+                kwargs["stored_as"] = sa
+            call = "dp.create_auto_cdc_from_snapshot_flow"
+        else:
+            if not cfg.sequence_by:
+                raise CompilationError(
+                    f"{model.name}: flow='auto_cdc' requires `sequence_by`"
+                )
+            seq = cfg.sequence_by
+            kwargs = {"target": target, "source": src_fn, "keys": cfg.keys,
+                      "sequence_by": (list(seq) if isinstance(seq, (list, tuple))
+                                      else seq)}
+            if cfg.apply_as_deletes:
+                kwargs["apply_as_deletes"] = cfg.apply_as_deletes
+            if cfg.apply_as_truncates:
+                kwargs["apply_as_truncates"] = cfg.apply_as_truncates
+            if cfg.ignore_null_updates:
+                kwargs["ignore_null_updates"] = cfg.ignore_null_updates
+            if sa:
+                kwargs["stored_as"] = sa
+            if cfg.once:
+                kwargs["once"] = True
+            call = "dp.create_auto_cdc_flow"
+        args = ", ".join(f"{k}={v!r}" for k, v in kwargs.items())
+        create = ("" if cfg.into else
+                  f"dp.create_streaming_table(name={model.dataset_name!r})\n\n")
+        return (f"{header}\n{create}"
+                f"def {src_fn}(spark):\n{body}\n\n{call}({args})\n")
 
     def _emit_auto_cdc(self, model: Model, *, snapshot: bool,
                        header: str, spec: str, clauses: str) -> str:
@@ -400,8 +524,8 @@ class Compiler:
         """
         assigned: Dict[str, Set[str]] = {}
         owner: Dict[str, str] = {}
-        for pname, selector in self.project.pipelines.items():
-            sel = set(self.graph.select(selector))
+        for pname, spec in self.project.pipelines.items():
+            sel = set(self.graph.select(spec["select"]))
             for n in sorted(sel):
                 m = self.parsed.models[n]
                 if m.is_ephemeral:
@@ -456,7 +580,8 @@ class Compiler:
                 sel &= set(self.graph.topo_order(self.graph.select(select)))
             order = [n for n in self.graph.topo_order() if n in sel]
             results[pname] = self._compile_one(
-                order, root_target / "pipelines" / pname, pname)
+                order, root_target / "pipelines" / pname, pname,
+                spec_overrides=self.project.pipelines[pname])
         if not results:
             raise CompilationError(
                 f"no pipelines matched {pipeline!r}; defined: "
@@ -465,7 +590,8 @@ class Compiler:
         return results
 
     def _compile_one(self, order: List[str], target: Path,
-                     spec_name: str) -> CompileResult:
+                     spec_name: str,
+                     spec_overrides: Optional[Dict] = None) -> CompileResult:
         """Emit one pipeline's definitions + spec + manifest for ``order``."""
         self._emitted = set(order)
         self._stream_views = set()
@@ -493,12 +619,13 @@ class Compiler:
                 nodes[name] = _manifest_node(model, emitted=None)
                 continue
             sql = self._emit(model)
-            f = defs / f"{model.dataset_name}.sql"
+            ext = ".py" if model.language == "python" else ".sql"
+            f = defs / f"{model.dataset_name}{ext}"
             f.write_text(sql)
             files.append(f)
             nodes[name] = _manifest_node(model, emitted=str(f.relative_to(target)))
 
-        spec = self._write_spec(target, spec_name)
+        spec = self._write_spec(target, spec_name, spec_overrides)
         manifest = self._write_manifest(target, nodes)
         return CompileResult(target_dir=target, spec_file=spec,
                              manifest_file=manifest, files=files,
@@ -520,19 +647,25 @@ class Compiler:
                              files=merged_files,
                              warnings=self.warnings)
 
-    def _write_spec(self, target: Path, name: str) -> Path:
+    def _write_spec(self, target: Path, name: str,
+                    overrides: Optional[Dict] = None) -> Path:
+        ov = overrides or {}
         spec: Dict = {
             "name": name,
             "libraries": [{"glob": {"include": "definitions/**"}}],
         }
-        storage = self.project.storage or f"file://{(target / 'storage').resolve()}"
+        storage = (ov.get("storage") or self.project.storage
+                   or f"file://{(target / 'storage').resolve()}")
         spec["storage"] = storage
-        if self.project.catalog:
-            spec["catalog"] = self.project.catalog
-        if self.project.schema:
-            spec["database"] = self.project.schema
-        if self.project.configuration:
-            spec["configuration"] = self.project.configuration
+        catalog = ov.get("catalog") or self.project.catalog
+        if catalog:
+            spec["catalog"] = catalog
+        schema = ov.get("schema") or ov.get("database") or self.project.schema
+        if schema:
+            spec["database"] = schema
+        conf = {**self.project.configuration, **(ov.get("configuration") or {})}
+        if conf:
+            spec["configuration"] = conf
         f = target / "spark-pipeline.yml"
         f.write_text(yaml.safe_dump(spec, sort_keys=False, default_flow_style=False))
         return f
@@ -569,4 +702,8 @@ def _manifest_node(model: Model, emitted: Optional[str]) -> Dict:
         "sources": list(model.sources),
         "emitted": emitted,
         "tags": model.config.tags,
+        "language": model.language,
+        "checksum": model.checksum,
+        "columns": model.columns,
+        "description": model.description,
     }

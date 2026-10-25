@@ -27,7 +27,7 @@ def test_example_project_parses(project, parsed):
         "stg_customers", "stg_orders", "order_item_totals",
         "customers", "order_events", "daily_revenue",
         "customers_scd2", "inventory_snapshot", "order_status_map",
-        "order_events_eu",
+        "order_events_eu", "customer_rank",
     }
     assert parsed.models["order_status_map"].resource_type == "seed"
     assert parsed.sources["raw.orders"].streaming is True
